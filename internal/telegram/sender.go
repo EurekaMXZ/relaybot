@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 
 	"github.com/go-telegram/bot"
@@ -12,11 +13,12 @@ import (
 )
 
 type Sender struct {
-	bot *bot.Bot
+	bot    *bot.Bot
+	logger *slog.Logger
 }
 
 func NewSender() *Sender {
-	return &Sender{}
+	return &Sender{logger: slog.Default().With("component", "telegram_sender")}
 }
 
 func (s *Sender) Bind(b *bot.Bot) {
@@ -24,31 +26,57 @@ func (s *Sender) Bind(b *bot.Bot) {
 }
 
 func (s *Sender) CopyOrResend(ctx context.Context, item relay.Relay, targetChatID int64) (relay.DeliveryMethod, int, error) {
+	logger := s.deliveryLogger(item, targetChatID)
+	logger.Info("telegram delivery started")
+
 	if messageID, err := s.copyMessage(ctx, item, targetChatID); err == nil {
+		logger.Info("telegram delivery completed",
+			slog.String("delivery_method", string(relay.DeliveryMethodCopyMessage)),
+			slog.Int("out_message_id", messageID),
+		)
 		return relay.DeliveryMethodCopyMessage, messageID, nil
 	} else if !shouldFallbackAfterCopyError(err) {
+		logDeliveryError(logger, "telegram copy message finished with unknown result", relay.DeliveryMethodCopyMessage, err, false)
 		return relay.DeliveryMethodCopyMessage, 0, err
+	} else {
+		logDeliveryError(logger, "telegram copy message failed, fallback to resend", relay.DeliveryMethodCopyMessage, err, true)
 	}
 
+	var (
+		method    relay.DeliveryMethod
+		messageID int
+		err       error
+	)
 	switch item.MediaKind {
 	case relay.MediaKindDocument:
-		messageID, err := s.sendDocument(ctx, item, targetChatID)
-		return relay.DeliveryMethodSendDocument, messageID, err
+		method = relay.DeliveryMethodSendDocument
+		messageID, err = s.sendDocument(ctx, item, targetChatID)
 	case relay.MediaKindPhoto:
-		messageID, err := s.sendPhoto(ctx, item, targetChatID)
-		return relay.DeliveryMethodSendPhoto, messageID, err
+		method = relay.DeliveryMethodSendPhoto
+		messageID, err = s.sendPhoto(ctx, item, targetChatID)
 	case relay.MediaKindVideo:
-		messageID, err := s.sendVideo(ctx, item, targetChatID)
-		return relay.DeliveryMethodSendVideo, messageID, err
+		method = relay.DeliveryMethodSendVideo
+		messageID, err = s.sendVideo(ctx, item, targetChatID)
 	case relay.MediaKindAudio:
-		messageID, err := s.sendAudio(ctx, item, targetChatID)
-		return relay.DeliveryMethodSendAudio, messageID, err
+		method = relay.DeliveryMethodSendAudio
+		messageID, err = s.sendAudio(ctx, item, targetChatID)
 	case relay.MediaKindVoice:
-		messageID, err := s.sendVoice(ctx, item, targetChatID)
-		return relay.DeliveryMethodSendVoice, messageID, err
+		method = relay.DeliveryMethodSendVoice
+		messageID, err = s.sendVoice(ctx, item, targetChatID)
 	default:
-		return "", 0, classifySendError(relay.ErrUnsupportedMedia)
+		err = classifySendError(relay.ErrUnsupportedMedia)
 	}
+
+	if err != nil {
+		logDeliveryError(logger, "telegram resend failed", method, err, false)
+		return method, 0, err
+	}
+
+	logger.Info("telegram delivery completed",
+		slog.String("delivery_method", string(method)),
+		slog.Int("out_message_id", messageID),
+	)
+	return method, messageID, nil
 }
 
 func shouldFallbackAfterCopyError(err error) bool {
@@ -189,4 +217,37 @@ func classifySendError(err error) error {
 		sendErr.unknown = true
 	}
 	return sendErr
+}
+
+func (s *Sender) deliveryLogger(item relay.Relay, targetChatID int64) *slog.Logger {
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default().With("component", "telegram_sender")
+	}
+	return logger.With(
+		slog.Int64("relay_id", item.ID),
+		slog.String("code_hint", item.CodeHint),
+		slog.Int64("uploader_chat_id", item.UploaderChatID),
+		slog.Int64("target_chat_id", targetChatID),
+		slog.Int("source_message_id", item.SourceMessageID),
+		slog.String("media_kind", string(item.MediaKind)),
+	)
+}
+
+func logDeliveryError(logger *slog.Logger, message string, method relay.DeliveryMethod, err error, fallback bool) {
+	attrs := []any{
+		slog.String("delivery_method", string(method)),
+		slog.Any("error", err),
+		slog.Bool("fallback", fallback),
+	}
+
+	var senderErr relay.SenderError
+	if errors.As(err, &senderErr) {
+		attrs = append(attrs,
+			slog.String("error_code", senderErr.Code()),
+			slog.Bool("unknown_result", senderErr.UnknownResult()),
+		)
+	}
+
+	logger.Warn(message, attrs...)
 }
