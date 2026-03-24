@@ -48,6 +48,24 @@ Telegram 文件中转 bot，基于 Telegram 原生文件中转方案实现。
 docker compose up -d
 ```
 
+当前 `compose.yaml` / `compose-dev.yaml` 已为 `postgres` 和 `redis` 配置命名卷持久化：
+
+- `postgres_data` 挂载到 `/var/lib/postgresql/data`
+- `redis_data` 挂载到 `/data`
+- `redis` 额外开启了 AOF（`appendonly yes`），降低容器重建后的数据丢失风险
+
+查看卷：
+
+```bash
+docker volume ls | grep relaybot
+```
+
+清空本地依赖数据时，需要连同卷一起删除：
+
+```bash
+docker compose down -v
+```
+
 示例环境变量：
 
 ```bash
