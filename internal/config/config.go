@@ -11,6 +11,7 @@ import (
 
 type Config struct {
 	BotToken              string
+	SyncBotCommands       bool
 	AppSecret             string
 	PostgresDSN           string
 	RedisAddr             string
@@ -40,6 +41,7 @@ func Load() (Config, error) {
 
 	cfg := Config{
 		BotToken:              strings.TrimSpace(os.Getenv("BOT_TOKEN")),
+		SyncBotCommands:       envBool("SYNC_BOT_COMMANDS", true),
 		AppSecret:             strings.TrimSpace(os.Getenv("APP_SECRET")),
 		PostgresDSN:           firstNonEmptyEnv("PG_DSN", "POSTGRES_DSN"),
 		RedisAddr:             envString("REDIS_ADDR", "127.0.0.1:6379"),

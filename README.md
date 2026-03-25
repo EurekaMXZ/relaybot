@@ -8,9 +8,10 @@ Telegram 文件中转 bot，基于 Telegram 原生文件中转方案实现。
 
 ## 本地部署
 
-需要配置以下环境变量：
+支持以下环境变量：
 
 - `BOT_TOKEN`
+- `SYNC_BOT_COMMANDS`（可选，默认 `true`）
 - `APP_SECRET`
 - `PG_DSN` 或 `POSTGRES_DSN`
 - `REDIS_ADDR`
@@ -38,6 +39,7 @@ Telegram 文件中转 bot，基于 Telegram 原生文件中转方案实现。
 
 - 未设置 `WEBHOOK_BASE_URL` / `WEBHOOK_PUBLIC_URL` 时，bot 以 long polling 方式运行。
 - 设置了 `WEBHOOK_BASE_URL` / `WEBHOOK_PUBLIC_URL` 时，bot 会自动注册 webhook。
+- 默认会在启动时把 `/start`、`/help` 同步到 Telegram 的私聊命令列表；可用 `SYNC_BOT_COMMANDS=false` 关闭。
 - 本地启动时会优先读取仓库根目录的 `.env`，但已存在于进程环境中的变量不会被覆盖。
 
 ## 本地开发

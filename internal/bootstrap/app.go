@@ -185,6 +185,8 @@ func (a *App) Run(ctx context.Context) error {
 		slog.Bool("webhook_enabled", a.cfg.WebhookEnabled()),
 	)
 
+	a.syncBotCommands(ctx)
+
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -303,4 +305,29 @@ func webhookHandler(cfg config.Config, botClient *bot.Bot) http.Handler {
 		return nil
 	}
 	return botClient.WebhookHandler()
+}
+
+func (a *App) syncBotCommands(ctx context.Context) {
+	if !a.cfg.SyncBotCommands {
+		a.logger.Info("skip telegram bot commands sync", slog.Bool("enabled", false))
+		return
+	}
+
+	syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	a.logger.Info(
+		"syncing telegram bot commands",
+		slog.String("scope", "all_private_chats"),
+		slog.Int("command_count", len(telegram.DefaultCommands())),
+	)
+	if err := telegram.SyncPrivateCommands(syncCtx, a.bot); err != nil {
+		a.logger.Warn("sync telegram bot commands failed", slog.Any("error", err))
+		return
+	}
+
+	a.logger.Info(
+		"telegram bot commands synced",
+		slog.String("scope", "all_private_chats"),
+	)
 }
