@@ -44,6 +44,7 @@ func (r *Router) HandleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 	msg := update.Message
 	logger := r.updateLogger(update)
 	logger.Debug("telegram update received", slog.String("chat_type", string(msg.Chat.Type)))
+	claims := ExtractClaimRelayInputs(update)
 
 	if msg.Chat.Type != "private" {
 		logger.Info("telegram update rejected", slog.String("reason", "non_private_chat"))
@@ -62,7 +63,9 @@ func (r *Router) HandleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		return
 	}
 
+	uploadHandled := false
 	if upload, ok := ExtractCreateRelayInput(update); ok {
+		uploadHandled = true
 		requestLogger := logger.With(
 			slog.String("operation", "create_relay"),
 			slog.String("media_kind", string(upload.MediaKind)),
@@ -74,70 +77,35 @@ func (r *Router) HandleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		if err != nil {
 			logTelegramRequestFailure(ctx, requestLogger, "telegram relay create failed", err)
 			r.replyText(ctx, b, msg.Chat.ID, r.describeError(err))
-			return
+			if len(claims) == 0 {
+				return
+			}
 		}
-		if result.Duplicated {
+		if err == nil && result.Duplicated {
 			requestLogger.Info("telegram relay create duplicated",
 				slog.Int64("relay_id", result.Relay.ID),
 				slog.String("code_hint", result.Relay.CodeHint),
 			)
-			return
+			if len(claims) == 0 {
+				return
+			}
 		}
-		requestLogger.Info("telegram relay created",
-			slog.Int64("relay_id", result.Relay.ID),
-			slog.String("code_hint", result.Relay.CodeHint),
-			slog.Time("expires_at", result.ExpiresAt),
-		)
-		r.replyText(ctx, b, msg.Chat.ID, formatCreateSuccess(result))
+		if err == nil && !result.Duplicated {
+			requestLogger.Info("telegram relay created",
+				slog.Int64("relay_id", result.Relay.ID),
+				slog.String("code_hint", result.Relay.CodeHint),
+				slog.Time("expires_at", result.ExpiresAt),
+			)
+			r.replyText(ctx, b, msg.Chat.ID, formatCreateSuccess(result))
+		}
+	}
+
+	if len(claims) > 0 {
+		r.handleClaimRelays(ctx, b, msg.Chat.ID, logger, claims)
 		return
 	}
 
-	if claim, ok := ExtractClaimRelayInput(update); ok {
-		requestLogger := logger.With(
-			slog.String("operation", "claim_relay"),
-			slog.String("code_hint", codeHint(claim.RawCode)),
-		)
-		requestLogger.Info("telegram relay claim requested")
-
-		result, err := r.service.ClaimRelay(ctx, claim)
-		if err != nil {
-			var attrs []any
-			if result.Relay.ID != 0 {
-				attrs = append(attrs,
-					slog.Int64("relay_id", result.Relay.ID),
-					slog.String("relay_status", string(result.Relay.Status)),
-				)
-			}
-			if result.Delivery.ID != 0 {
-				attrs = append(attrs,
-					slog.Int64("delivery_id", result.Delivery.ID),
-					slog.String("delivery_status", string(result.Delivery.Status)),
-				)
-			}
-			if result.Method != "" {
-				attrs = append(attrs, slog.String("delivery_method", string(result.Method)))
-			}
-			logTelegramRequestFailure(ctx, requestLogger, "telegram relay claim failed", err, attrs...)
-			r.replyText(ctx, b, msg.Chat.ID, r.describeError(err))
-			return
-		}
-		if result.Duplicated {
-			requestLogger.Info("telegram relay claim duplicated",
-				slog.Int64("relay_id", result.Relay.ID),
-				slog.String("code_hint", result.Relay.CodeHint),
-				slog.Int64("delivery_id", result.Delivery.ID),
-				slog.String("delivery_status", string(result.Delivery.Status)),
-				slog.String("delivery_method", string(result.Method)),
-			)
-			return
-		}
-		requestLogger.Info("telegram relay claimed",
-			slog.Int64("relay_id", result.Relay.ID),
-			slog.String("code_hint", result.Relay.CodeHint),
-			slog.Int64("delivery_id", result.Delivery.ID),
-			slog.String("delivery_method", string(result.Method)),
-			slog.Int("out_message_id", result.OutMessageID),
-		)
+	if uploadHandled {
 		return
 	}
 
@@ -199,7 +167,7 @@ func formatCreateSuccess(result relay.CreateRelayResult) string {
 }
 
 func usageText() string {
-	return "把文件或常见媒体直接发给我，我会返回一串 relaybot code；把 code 再发给我，就能取回原文件。"
+	return "把文件或常见媒体直接发给我，我会返回一串 relaybot code；把一个或多个 code 发给我，就能取回原文件。"
 }
 
 func (r *Router) updateLogger(update *models.Update) *slog.Logger {
@@ -234,4 +202,70 @@ func isExpectedTelegramError(err error) bool {
 	default:
 		return false
 	}
+}
+
+func (r *Router) handleClaimRelays(ctx context.Context, b *bot.Bot, chatID int64, logger *slog.Logger, claims []relay.ClaimRelayInput) {
+	failedLines := make([]string, 0, len(claims))
+
+	for index, claim := range claims {
+		requestLogger := logger.With(
+			slog.String("operation", "claim_relay"),
+			slog.String("code_hint", codeHint(claim.RawCode)),
+			slog.Int("claim_index", index),
+			slog.Int("claim_count", len(claims)),
+		)
+		requestLogger.Info("telegram relay claim requested")
+
+		result, err := r.service.ClaimRelay(ctx, claim)
+		if err != nil {
+			var attrs []any
+			if result.Relay.ID != 0 {
+				attrs = append(attrs,
+					slog.Int64("relay_id", result.Relay.ID),
+					slog.String("relay_status", string(result.Relay.Status)),
+				)
+			}
+			if result.Delivery.ID != 0 {
+				attrs = append(attrs,
+					slog.Int64("delivery_id", result.Delivery.ID),
+					slog.String("delivery_status", string(result.Delivery.Status)),
+				)
+			}
+			if result.Method != "" {
+				attrs = append(attrs, slog.String("delivery_method", string(result.Method)))
+			}
+			logTelegramRequestFailure(ctx, requestLogger, "telegram relay claim failed", err, attrs...)
+			failedLines = append(failedLines, formatClaimFailure(claim.RawCode, r.describeError(err), len(claims) > 1))
+			continue
+		}
+		if result.Duplicated {
+			requestLogger.Info("telegram relay claim duplicated",
+				slog.Int64("relay_id", result.Relay.ID),
+				slog.String("code_hint", result.Relay.CodeHint),
+				slog.Int64("delivery_id", result.Delivery.ID),
+				slog.String("delivery_status", string(result.Delivery.Status)),
+				slog.String("delivery_method", string(result.Method)),
+			)
+			continue
+		}
+		requestLogger.Info("telegram relay claimed",
+			slog.Int64("relay_id", result.Relay.ID),
+			slog.String("code_hint", result.Relay.CodeHint),
+			slog.Int64("delivery_id", result.Delivery.ID),
+			slog.String("delivery_method", string(result.Method)),
+			slog.Int("out_message_id", result.OutMessageID),
+		)
+	}
+
+	if len(failedLines) == 0 {
+		return
+	}
+	r.replyText(ctx, b, chatID, strings.Join(failedLines, "\n"))
+}
+
+func formatClaimFailure(rawCode, message string, includeCodeHint bool) string {
+	if !includeCodeHint {
+		return message
+	}
+	return fmt.Sprintf("%s：%s", codeHint(rawCode), message)
 }
