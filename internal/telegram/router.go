@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"strings"
 	"time"
@@ -141,7 +142,7 @@ func (r *Router) handleBatchDone(ctx context.Context, b *bot.Bot, logger *slog.L
 		slog.Int("item_count", result.ItemCount),
 		slog.Time("expires_at", result.ExpiresAt),
 	)
-	r.replyText(ctx, b, msg.Chat.ID, formatBatchFinishSuccess(result))
+	r.replyHTML(ctx, b, msg.Chat.ID, formatBatchFinishSuccessHTML(result))
 }
 
 func (r *Router) handleBatchCancel(ctx context.Context, b *bot.Bot, logger *slog.Logger, msg *models.Message) {
@@ -230,7 +231,7 @@ func (r *Router) handleCreateRelay(ctx context.Context, b *bot.Bot, logger *slog
 			slog.Int64("relay_id", result.Relay.ID),
 			slog.String("code_hint", result.Relay.CodeHint),
 		)
-		r.replyText(ctx, b, msg.Chat.ID, formatCreateSuccess(result))
+		r.replyHTML(ctx, b, msg.Chat.ID, formatCreateSuccessHTML(result))
 		return
 	}
 	requestLogger.Info("telegram relay created",
@@ -238,7 +239,7 @@ func (r *Router) handleCreateRelay(ctx context.Context, b *bot.Bot, logger *slog
 		slog.String("code_hint", result.Relay.CodeHint),
 		slog.Time("expires_at", result.ExpiresAt),
 	)
-	r.replyText(ctx, b, msg.Chat.ID, formatCreateSuccess(result))
+	r.replyHTML(ctx, b, msg.Chat.ID, formatCreateSuccessHTML(result))
 }
 
 func (r *Router) describeError(err error) string {
@@ -289,18 +290,28 @@ func (r *Router) replyText(ctx context.Context, b *bot.Bot, chatID int64, text s
 	}
 }
 
-func formatCreateSuccess(result relay.CreateRelayResult) string {
+func (r *Router) replyHTML(ctx context.Context, b *bot.Bot, chatID int64, text string) {
+	if _, err := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:    chatID,
+		Text:      text,
+		ParseMode: models.ParseModeHTML,
+	}); err != nil {
+		r.logger.Error("send HTML message failed", slog.Int64("chat_id", chatID), slog.Any("error", err))
+	}
+}
+
+func formatCreateSuccessHTML(result relay.CreateRelayResult) string {
 	return fmt.Sprintf(
-		"中转码：%s\n有效期至：%s\n把这串 code 发给 bot，即可取回原文件。",
-		result.Code,
+		"中转码：\n<code>%s</code>\n\n有效期至：%s\n把这串 code 发给 bot，即可取回原文件。",
+		html.EscapeString(result.Code),
 		result.ExpiresAt.UTC().Format(time.RFC3339),
 	)
 }
 
-func formatBatchFinishSuccess(result relay.FinishBatchUploadResult) string {
+func formatBatchFinishSuccessHTML(result relay.FinishBatchUploadResult) string {
 	return fmt.Sprintf(
-		"批量中转码：%s\n文件数：%d\n有效期至：%s\n把这串 code 发给 bot，即可取回这批文件。",
-		result.Code,
+		"批量中转码：\n<code>%s</code>\n\n文件数：%d\n有效期至：%s\n把这串 code 发给 bot，即可取回这批文件。",
+		html.EscapeString(result.Code),
 		result.ItemCount,
 		result.ExpiresAt.UTC().Format(time.RFC3339),
 	)
