@@ -9,11 +9,9 @@ import (
 )
 
 const (
-	codePrefix        = "RELAYBOT_"
-	codeGroupSize     = 4
-	codeEntropyBytes  = 10
-	codeEncodedLength = 16
-	crockfordAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	displayCodePrefix  = "relaybot_"
+	modernCodeLength   = 20
+	modernCodeAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
 
 type HMACCodeManager struct {
@@ -25,39 +23,33 @@ func NewHMACCodeManager(secret string) *HMACCodeManager {
 }
 
 func (m *HMACCodeManager) Generate() (string, string, string, error) {
-	raw := make([]byte, codeEntropyBytes)
-	if _, err := rand.Read(raw); err != nil {
+	body, err := randomString(modernCodeLength, modernCodeAlphabet)
+	if err != nil {
 		return "", "", "", err
 	}
 
-	encoded := crockfordEncode(raw)
-	normalized := codePrefix + encoded
-	display := formatDisplayCode(normalized)
-	return display, m.Hash(normalized), encoded[len(encoded)-4:], nil
+	display := displayCodePrefix + body
+	return display, m.Hash(display), body[len(body)-4:], nil
 }
 
 func (m *HMACCodeManager) Normalize(raw string) (string, error) {
-	candidate := strings.ToUpper(strings.TrimSpace(raw))
-	candidate = strings.ReplaceAll(candidate, "-", "")
-	candidate = strings.ReplaceAll(candidate, " ", "")
-	candidate = strings.ReplaceAll(candidate, "_", "")
-	if strings.HasPrefix(candidate, "RELAYBOT") && !strings.HasPrefix(candidate, codePrefix) {
-		candidate = codePrefix + strings.TrimPrefix(candidate, "RELAYBOT")
+	candidate := strings.TrimSpace(raw)
+	if candidate == "" {
+		return "", ErrInvalidCode
 	}
-	if !strings.HasPrefix(candidate, codePrefix) {
+	if len(candidate) != len(displayCodePrefix)+modernCodeLength {
+		return "", ErrInvalidCode
+	}
+	if !strings.EqualFold(candidate[:len(displayCodePrefix)], displayCodePrefix) {
 		return "", ErrInvalidCode
 	}
 
-	body := strings.TrimPrefix(candidate, codePrefix)
-	if len(body) != codeEncodedLength {
-		return "", ErrInvalidCode
+	body := candidate[len(displayCodePrefix):]
+	switch {
+	case isModernCodeBody(body):
+		return displayCodePrefix + body, nil
 	}
-	for _, ch := range body {
-		if !strings.ContainsRune(crockfordAlphabet, ch) {
-			return "", ErrInvalidCode
-		}
-	}
-	return codePrefix + body, nil
+	return "", ErrInvalidCode
 }
 
 func (m *HMACCodeManager) Hash(normalized string) string {
@@ -66,48 +58,62 @@ func (m *HMACCodeManager) Hash(normalized string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func formatDisplayCode(normalized string) string {
-	body := strings.TrimPrefix(normalized, codePrefix)
-	var groups []string
-	for start := 0; start < len(body); start += codeGroupSize {
-		groups = append(groups, body[start:start+codeGroupSize])
-	}
-	return "relaybot_" + strings.Join(groups, "-")
-}
-
-func crockfordEncode(input []byte) string {
-	if len(input) == 0 {
+func compactCode(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		return ""
 	}
 
-	var (
-		value uint64
-		bits  uint
-		out   strings.Builder
-	)
-
-	out.Grow(codeEncodedLength)
-	for _, current := range input {
-		value = (value << 8) | uint64(current)
-		bits += 8
-		for bits >= 5 {
-			index := (value >> (bits - 5)) & 0x1F
-			out.WriteByte(crockfordAlphabet[index])
-			bits -= 5
+	var b strings.Builder
+	b.Grow(len(trimmed))
+	for _, r := range trimmed {
+		switch {
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
 		}
 	}
+	return b.String()
+}
 
-	if bits > 0 {
-		index := (value << (5 - bits)) & 0x1F
-		out.WriteByte(crockfordAlphabet[index])
+func isModernCodeBody(body string) bool {
+	for _, ch := range body {
+		switch {
+		case ch >= '0' && ch <= '9':
+		case ch >= 'A' && ch <= 'Z':
+		case ch >= 'a' && ch <= 'z':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func randomString(length int, alphabet string) (string, error) {
+	if length <= 0 {
+		return "", nil
 	}
 
-	encoded := out.String()
-	if len(encoded) > codeEncodedLength {
-		return encoded[:codeEncodedLength]
+	limit := byte(256 - (256 % len(alphabet)))
+	out := make([]byte, length)
+	buf := make([]byte, length)
+	for index := 0; index < length; {
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		for _, current := range buf {
+			if current >= limit {
+				continue
+			}
+			out[index] = alphabet[int(current)%len(alphabet)]
+			index++
+			if index == length {
+				return string(out), nil
+			}
+		}
 	}
-	if len(encoded) == codeEncodedLength {
-		return encoded
-	}
-	return encoded + strings.Repeat("0", codeEncodedLength-len(encoded))
+	return string(out), nil
 }

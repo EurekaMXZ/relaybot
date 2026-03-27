@@ -1107,12 +1107,13 @@ func (systemClock) Now() time.Time {
 }
 
 func claimCodeHint(raw string) string {
-	normalized := strings.ToLower(strings.TrimSpace(raw))
-	if normalized == "" {
+	compact := compactCode(raw)
+	if compact == "" {
 		return ""
 	}
-	if strings.HasPrefix(normalized, "relaybot_") {
-		suffix := strings.TrimPrefix(normalized, "relaybot_")
+	lowerCompact := strings.ToLower(compact)
+	if strings.HasPrefix(lowerCompact, "relaybot") {
+		suffix := compact[len("relaybot"):]
 		switch {
 		case suffix == "":
 			return "relaybot_"
@@ -1122,8 +1123,8 @@ func claimCodeHint(raw string) string {
 			return "relaybot_" + suffix[:2] + "..."
 		}
 	}
-	if len(normalized) <= 4 {
-		return normalized[:1] + "..."
+	if len(compact) <= 4 {
+		return compact[:1] + "..."
 	}
-	return normalized[:4] + "..."
+	return compact[:4] + "..."
 }

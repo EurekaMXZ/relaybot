@@ -11,7 +11,7 @@ import (
 
 const claimRequestSequenceBits = 16
 
-var claimCodePattern = regexp.MustCompile(`(?i)relaybot[_\s-]?[0-9a-hjkmnp-tv-z]{4}(?:[-_\s]?[0-9a-hjkmnp-tv-z]{4}){3}`)
+var claimCodePattern = regexp.MustCompile(`(?i:relaybot_)[A-Za-z0-9]{20}`)
 
 func ExtractCreateRelayInput(update *models.Update) (relay.CreateRelayInput, bool) {
 	if update == nil || update.Message == nil || update.Message.From == nil {
@@ -138,18 +138,34 @@ func claimContent(message *models.Message) string {
 }
 
 func canonicalClaimCode(raw string) string {
-	candidate := strings.ToUpper(strings.TrimSpace(raw))
+	candidate := strings.TrimSpace(raw)
 	if candidate == "" {
 		return ""
 	}
-
-	candidate = strings.ReplaceAll(candidate, "-", "")
-	candidate = strings.ReplaceAll(candidate, " ", "")
-	candidate = strings.ReplaceAll(candidate, "_", "")
-	if strings.HasPrefix(candidate, "RELAYBOT") && !strings.HasPrefix(candidate, "RELAYBOT_") {
-		candidate = "RELAYBOT_" + strings.TrimPrefix(candidate, "RELAYBOT")
+	if len(candidate) != len("relaybot_")+20 {
+		return ""
 	}
-	return candidate
+	if !strings.EqualFold(candidate[:len("relaybot_")], "relaybot_") {
+		return ""
+	}
+	body := candidate[len("relaybot_"):]
+	if !isClaimCodeBody(body) {
+		return ""
+	}
+	return "relaybot_" + body
+}
+
+func isClaimCodeBody(body string) bool {
+	for _, r := range body {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func claimRequestUpdateID(updateID int64, sequence int) int64 {

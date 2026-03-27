@@ -50,7 +50,7 @@ func codeHint(raw string) string {
 }
 
 func sanitizeClaimCode(raw string) string {
-	trimmed := strings.TrimSpace(strings.ToUpper(raw))
+	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return ""
 	}
@@ -63,5 +63,10 @@ func sanitizeClaimCode(raw string) string {
 		}
 	}
 
-	return strings.TrimPrefix(b.String(), "RELAYBOT")
+	sanitized := b.String()
+	lowerSanitized := strings.ToLower(sanitized)
+	if strings.HasPrefix(lowerSanitized, "relaybot") {
+		return sanitized[len("relaybot"):]
+	}
+	return sanitized
 }
