@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -21,7 +22,10 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("ensure schema_migrations: %w", err)
 	}
 
-	migrationsDir := filepath.Join("db", "migrations")
+	migrationsDir, err := resolveMigrationsDir()
+	if err != nil {
+		return err
+	}
 
 	entries, err := os.ReadDir(migrationsDir)
 	if err != nil {
@@ -69,6 +73,25 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	return nil
+}
+
+func resolveMigrationsDir() (string, error) {
+	candidates := []string{
+		filepath.Join("db", "migrations"),
+	}
+
+	if _, file, _, ok := runtime.Caller(0); ok {
+		candidates = append(candidates, filepath.Join(filepath.Dir(file), "..", "..", "..", "db", "migrations"))
+	}
+
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil && info.IsDir() {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf("resolve migrations dir: none of %v exists", candidates)
 }
 
 func migrationApplied(ctx context.Context, pool *pgxpool.Pool, version string) (bool, error) {

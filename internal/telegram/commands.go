@@ -11,6 +11,9 @@ func DefaultCommands() []models.BotCommand {
 	return []models.BotCommand{
 		{Command: "start", Description: "查看使用说明"},
 		{Command: "help", Description: "查看帮助"},
+		{Command: "batch_start", Description: "开始批量上传"},
+		{Command: "batch_done", Description: "完成批量上传并生成 code"},
+		{Command: "batch_cancel", Description: "取消当前批量上传"},
 	}
 }
 

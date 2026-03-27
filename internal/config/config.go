@@ -24,12 +24,14 @@ type Config struct {
 	RelayTTL              time.Duration
 	MaxFileBytes          int64
 	ActiveRelaysPerUser   int64
+	MaxBatchItems         int
 	UploadRateLimit       int
 	UploadRateWindow      time.Duration
 	ClaimRateLimit        int
 	ClaimRateWindow       time.Duration
 	BadCodeRateLimit      int
 	BadCodeRateWindow     time.Duration
+	BatchSessionTTL       time.Duration
 	StaleDeliveryAfter    time.Duration
 	ExpiredDeliveryRetain time.Duration
 	AllowDangerousFiles   bool
@@ -54,12 +56,14 @@ func Load() (Config, error) {
 		RelayTTL:              envDuration("RELAY_TTL", 24*time.Hour),
 		MaxFileBytes:          envInt64("MAX_FILE_BYTES", 10*1024*1024*1024),
 		ActiveRelaysPerUser:   envInt64("ACTIVE_RELAYS_PER_USER", 100),
+		MaxBatchItems:         envInt("MAX_BATCH_ITEMS", 100),
 		UploadRateLimit:       envInt("UPLOAD_RATE_LIMIT", 5),
 		UploadRateWindow:      envDuration("UPLOAD_RATE_WINDOW", 10*time.Minute),
 		ClaimRateLimit:        envInt("CLAIM_RATE_LIMIT", 15),
 		ClaimRateWindow:       envDuration("CLAIM_RATE_WINDOW", 10*time.Minute),
 		BadCodeRateLimit:      envInt("BAD_CODE_RATE_LIMIT", 10),
 		BadCodeRateWindow:     envDuration("BAD_CODE_RATE_WINDOW", 10*time.Minute),
+		BatchSessionTTL:       envDuration("BATCH_SESSION_TTL", 30*time.Minute),
 		StaleDeliveryAfter:    envDuration("STALE_DELIVERY_AFTER", 2*time.Minute),
 		ExpiredDeliveryRetain: envDuration("EXPIRED_DELIVERY_RETAIN", 7*24*time.Hour),
 		AllowDangerousFiles:   envBool("ALLOW_DANGEROUS_FILES", false),
@@ -73,6 +77,8 @@ func Load() (Config, error) {
 		return Config{}, errors.New("APP_SECRET is required")
 	case cfg.PostgresDSN == "":
 		return Config{}, errors.New("PG_DSN (or POSTGRES_DSN) is required")
+	case cfg.MaxBatchItems <= 0:
+		return Config{}, errors.New("MAX_BATCH_ITEMS must be greater than 0")
 	}
 
 	return cfg, nil

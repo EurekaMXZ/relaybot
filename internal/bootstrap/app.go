@@ -94,7 +94,9 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		relay.Limits{
 			MaxFileBytes:         cfg.MaxFileBytes,
 			MaxActiveRelays:      cfg.ActiveRelaysPerUser,
+			MaxBatchItems:        cfg.MaxBatchItems,
 			DefaultTTL:           cfg.RelayTTL,
+			BatchSessionTTL:      cfg.BatchSessionTTL,
 			UnknownDeliveryAfter: cfg.StaleDeliveryAfter,
 			ExpiredDeliveryPurge: cfg.ExpiredDeliveryRetain,
 			ForbiddenExtensions:  forbiddenExtensions,
@@ -105,6 +107,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		slog.Duration("relay_ttl", cfg.RelayTTL),
 		slog.Int64("max_file_bytes", cfg.MaxFileBytes),
 		slog.Int64("active_relays_per_user", cfg.ActiveRelaysPerUser),
+		slog.Int("max_batch_items", cfg.MaxBatchItems),
+		slog.Duration("batch_session_ttl", cfg.BatchSessionTTL),
 		slog.Bool("allow_dangerous_files", cfg.AllowDangerousFiles),
 	)
 
@@ -148,11 +152,13 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	)
 
 	runner := worker.NewRunner(store, nil, relay.Limits{
+		BatchSessionTTL:      cfg.BatchSessionTTL,
 		UnknownDeliveryAfter: cfg.StaleDeliveryAfter,
 		ExpiredDeliveryPurge: cfg.ExpiredDeliveryRetain,
 	}, runnerLogger)
 	logger.Info(
 		"maintenance runner prepared",
+		slog.Duration("batch_session_ttl", cfg.BatchSessionTTL),
 		slog.Duration("unknown_delivery_after", cfg.StaleDeliveryAfter),
 		slog.Duration("expired_delivery_purge", cfg.ExpiredDeliveryRetain),
 	)

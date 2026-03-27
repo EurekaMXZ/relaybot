@@ -37,6 +37,7 @@ func (r *Runner) Run(ctx context.Context) {
 
 	r.logger.Info("maintenance runner started",
 		"interval", time.Minute.String(),
+		"batch_session_ttl", r.limits.BatchSessionTTL.String(),
 		"unknown_delivery_after", r.limits.UnknownDeliveryAfter.String(),
 		"expired_delivery_purge", r.limits.ExpiredDeliveryPurge.String(),
 	)
@@ -59,17 +60,23 @@ func (r *Runner) runOnce(ctx context.Context) {
 	unknownCutoff := now.Add(-r.limits.UnknownDeliveryAfter)
 	purgeCutoff := now.Add(-r.limits.ExpiredDeliveryPurge)
 	var (
+		expiredBatchSessions    int64
 		expiredRelays           int64
 		unknownDeliveries       int64
 		purgedExpiredDeliveries int64
 		hadError                bool
 	)
 
-	expiredRelays, hadError = r.runTask(ctx, "expire_relays", []any{"cutoff", now}, func(taskCtx context.Context) (int64, error) {
-		return r.store.ExpireRelays(taskCtx, now)
+	expiredBatchSessions, hadError = r.runTask(ctx, "purge_collecting_relays", []any{"cutoff", now.Add(-r.limits.BatchSessionTTL)}, func(taskCtx context.Context) (int64, error) {
+		return r.store.DeleteCollectingRelaysBefore(taskCtx, now.Add(-r.limits.BatchSessionTTL))
 	})
 
 	var taskErr bool
+	expiredRelays, taskErr = r.runTask(ctx, "expire_relays", []any{"cutoff", now}, func(taskCtx context.Context) (int64, error) {
+		return r.store.ExpireRelays(taskCtx, now)
+	})
+	hadError = hadError || taskErr
+
 	unknownDeliveries, taskErr = r.runTask(ctx, "mark_unknown_deliveries", []any{"cutoff", unknownCutoff}, func(taskCtx context.Context) (int64, error) {
 		return r.store.MarkUnknownDeliveriesBefore(taskCtx, unknownCutoff)
 	})
@@ -80,8 +87,9 @@ func (r *Runner) runOnce(ctx context.Context) {
 	})
 	hadError = hadError || taskErr
 
-	if hadError || expiredRelays > 0 || unknownDeliveries > 0 || purgedExpiredDeliveries > 0 {
+	if hadError || expiredBatchSessions > 0 || expiredRelays > 0 || unknownDeliveries > 0 || purgedExpiredDeliveries > 0 {
 		r.logger.Info("maintenance cycle completed",
+			"expired_batch_sessions", expiredBatchSessions,
 			"expired_relays", expiredRelays,
 			"unknown_deliveries", unknownDeliveries,
 			"purged_expired_deliveries", purgedExpiredDeliveries,

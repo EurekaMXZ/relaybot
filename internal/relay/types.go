@@ -15,8 +15,9 @@ const (
 type RelayStatus string
 
 const (
-	RelayStatusReady   RelayStatus = "ready"
-	RelayStatusExpired RelayStatus = "expired"
+	RelayStatusCollecting RelayStatus = "collecting"
+	RelayStatusReady      RelayStatus = "ready"
+	RelayStatusExpired    RelayStatus = "expired"
 )
 
 type DeliveryStatus string
@@ -37,18 +38,32 @@ const (
 	DeliveryMethodSendVideo    DeliveryMethod = "send_video"
 	DeliveryMethodSendAudio    DeliveryMethod = "send_audio"
 	DeliveryMethodSendVoice    DeliveryMethod = "send_voice"
+	DeliveryMethodSendBatch    DeliveryMethod = "send_batch"
 )
 
 type Relay struct {
+	ID             int64
+	SourceUpdateID int64
+	CodeValue      string
+	CodeHash       string
+	CodeHint       string
+	Status         RelayStatus
+	UploaderUserID int64
+	UploaderChatID int64
+	DeliveryCount  int64
+	LastClaimedAt  *time.Time
+	ExpiresAt      time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+type RelayItem struct {
 	ID                   int64
+	RelayID              int64
 	SourceUpdateID       int64
-	CodeValue            string
-	CodeHash             string
-	CodeHint             string
-	Status               RelayStatus
-	UploaderUserID       int64
-	UploaderChatID       int64
 	SourceMessageID      int
+	MediaGroupID         string
+	ItemOrder            int
 	MediaKind            MediaKind
 	TelegramFileID       string
 	TelegramFileUniqueID string
@@ -56,11 +71,16 @@ type Relay struct {
 	MIMEType             string
 	FileSizeBytes        int64
 	Caption              string
-	DeliveryCount        int64
-	LastClaimedAt        *time.Time
-	ExpiresAt            time.Time
 	CreatedAt            time.Time
-	UpdatedAt            time.Time
+}
+
+type BatchUploadSession struct {
+	RelayID        int64
+	UploaderUserID int64
+	UploaderChatID int64
+	ItemCount      int
+	StartedAt      time.Time
+	LastActivityAt time.Time
 }
 
 type Delivery struct {
@@ -115,6 +135,59 @@ type ClaimRelayResult struct {
 	Duplicated   bool
 }
 
+type StartBatchUploadInput struct {
+	UploaderUserID int64
+	UploaderChatID int64
+}
+
+type AppendBatchItemInput struct {
+	SourceUpdateID       int64
+	UploaderUserID       int64
+	UploaderChatID       int64
+	SourceMessageID      int
+	MediaGroupID         string
+	MediaKind            MediaKind
+	TelegramFileID       string
+	TelegramFileUniqueID string
+	FileName             string
+	MIMEType             string
+	FileSizeBytes        int64
+	Caption              string
+}
+
+type FinishBatchUploadInput struct {
+	UploaderUserID int64
+	UploaderChatID int64
+}
+
+type CancelBatchUploadInput struct {
+	UploaderUserID int64
+	UploaderChatID int64
+}
+
+type StartBatchUploadResult struct {
+	Relay Relay
+}
+
+type AppendBatchItemResult struct {
+	Relay      Relay
+	Item       RelayItem
+	ItemCount  int
+	Duplicated bool
+}
+
+type FinishBatchUploadResult struct {
+	Relay     Relay
+	Code      string
+	ExpiresAt time.Time
+	ItemCount int
+}
+
+type CancelBatchUploadResult struct {
+	RelayID   int64
+	ItemCount int
+}
+
 type CreateRelayParams struct {
 	SourceUpdateID       int64
 	CodeValue            string
@@ -132,6 +205,38 @@ type CreateRelayParams struct {
 	Caption              string
 	ExpiresAt            time.Time
 	CreatedAt            time.Time
+}
+
+type CreateRelayBatchParams struct {
+	UploaderUserID int64
+	UploaderChatID int64
+	CreatedAt      time.Time
+}
+
+type AddRelayItemParams struct {
+	RelayID              int64
+	SourceUpdateID       int64
+	SourceMessageID      int
+	MediaGroupID         string
+	MaxBatchItems        int
+	ItemOrder            int
+	MediaKind            MediaKind
+	TelegramFileID       string
+	TelegramFileUniqueID string
+	FileName             string
+	MIMEType             string
+	FileSizeBytes        int64
+	Caption              string
+	CreatedAt            time.Time
+}
+
+type FinalizeRelayBatchParams struct {
+	RelayID   int64
+	CodeValue string
+	CodeHash  string
+	CodeHint  string
+	ExpiresAt time.Time
+	UpdatedAt time.Time
 }
 
 type CreateDeliveryParams struct {

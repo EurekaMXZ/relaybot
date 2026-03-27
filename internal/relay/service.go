@@ -171,7 +171,7 @@ func (s *Service) CreateRelay(ctx context.Context, input CreateRelayInput) (Crea
 		return CreateRelayResult{}, err
 	}
 
-	if ttl := time.Until(item.ExpiresAt); ttl > 0 {
+	if ttl := item.ExpiresAt.Sub(now); ttl > 0 {
 		if err := s.cache.SetRelayIDByCodeHash(ctx, item.CodeHash, item.ID, ttl); err != nil {
 			s.logger.LogAttrs(ctx, slog.LevelWarn, "relay cache warm failed",
 				append(attrs,
@@ -202,6 +202,398 @@ func (s *Service) CreateRelay(ctx context.Context, input CreateRelayInput) (Crea
 		Code:       item.CodeValue,
 		ExpiresAt:  item.ExpiresAt,
 		Duplicated: !created,
+	}, nil
+}
+
+func (s *Service) StartBatchUpload(ctx context.Context, input StartBatchUploadInput) (StartBatchUploadResult, error) {
+	now := s.clock.Now().UTC()
+	attrs := batchSessionAttrs(input.UploaderUserID, input.UploaderChatID)
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload start requested", attrs...)
+
+	session, ok, err := s.cache.GetBatchUploadSession(ctx, input.UploaderChatID)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload start failed", append(attrs, slog.Any("error", err))...)
+		return StartBatchUploadResult{}, err
+	}
+	if ok {
+		existing, err := s.store.GetRelayByID(ctx, session.RelayID)
+		switch {
+		case err == nil && existing.Status == RelayStatusCollecting:
+			s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload start rejected",
+				append(attrs, slog.String("reason", "active_batch_session"), slog.Int64("relay_id", existing.ID))...,
+			)
+			return StartBatchUploadResult{}, ErrBatchSessionActive
+		case err == nil || errors.Is(err, ErrRelayNotFound):
+			_ = s.cache.DeleteBatchUploadSession(ctx, input.UploaderChatID)
+		case err != nil:
+			s.logger.LogAttrs(ctx, slog.LevelError, "batch upload start failed", append(attrs, slog.Any("error", err))...)
+			return StartBatchUploadResult{}, err
+		}
+	}
+
+	batch, err := s.store.CreateRelayBatch(ctx, CreateRelayBatchParams{
+		UploaderUserID: input.UploaderUserID,
+		UploaderChatID: input.UploaderChatID,
+		CreatedAt:      now,
+	})
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload start failed",
+			append(attrs, slog.String("stage", "create_batch"), slog.Any("error", err))...,
+		)
+		return StartBatchUploadResult{}, err
+	}
+
+	session = BatchUploadSession{
+		RelayID:        batch.ID,
+		UploaderUserID: input.UploaderUserID,
+		UploaderChatID: input.UploaderChatID,
+		ItemCount:      0,
+		StartedAt:      now,
+		LastActivityAt: now,
+	}
+	if err := s.cache.SetBatchUploadSession(ctx, session, s.limits.BatchSessionTTL); err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload start failed",
+			append(attrs, slog.String("stage", "persist_session"), slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+		)
+		_ = s.store.DeleteRelay(ctx, batch.ID)
+		return StartBatchUploadResult{}, err
+	}
+
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload session started",
+		append(attrs, slog.Int64("relay_id", batch.ID))...,
+	)
+	return StartBatchUploadResult{Relay: batch}, nil
+}
+
+func (s *Service) AppendBatchItem(ctx context.Context, input AppendBatchItemInput) (AppendBatchItemResult, error) {
+	now := s.clock.Now().UTC()
+	attrs := append(batchSessionAttrs(input.UploaderUserID, input.UploaderChatID), createRelayAttrs(CreateRelayInput{
+		SourceUpdateID:  input.SourceUpdateID,
+		UploaderUserID:  input.UploaderUserID,
+		UploaderChatID:  input.UploaderChatID,
+		SourceMessageID: input.SourceMessageID,
+		MediaKind:       input.MediaKind,
+		FileName:        input.FileName,
+		FileSizeBytes:   input.FileSizeBytes,
+	})...)
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "batch item append requested", attrs...)
+
+	session, batch, err := s.getCollectingBatchSession(ctx, input.UploaderChatID)
+	if err != nil {
+		if errors.Is(err, ErrBatchSessionNotFound) {
+			s.logger.LogAttrs(ctx, slog.LevelInfo, "batch item append rejected",
+				append(attrs, slog.String("reason", "batch_session_not_found"))...,
+			)
+		}
+		return AppendBatchItemResult{}, err
+	}
+
+	if err := s.validateUploadInput(ctx, input.UploaderUserID, input.MediaKind, input.FileName, input.FileSizeBytes, attrs); err != nil {
+		return AppendBatchItemResult{}, err
+	}
+
+	item, created, err := s.store.AddRelayItem(ctx, AddRelayItemParams{
+		RelayID:              batch.ID,
+		SourceUpdateID:       input.SourceUpdateID,
+		SourceMessageID:      input.SourceMessageID,
+		MediaGroupID:         input.MediaGroupID,
+		MaxBatchItems:        s.limits.MaxBatchItems,
+		ItemOrder:            0,
+		MediaKind:            input.MediaKind,
+		TelegramFileID:       input.TelegramFileID,
+		TelegramFileUniqueID: input.TelegramFileUniqueID,
+		FileName:             input.FileName,
+		MIMEType:             input.MIMEType,
+		FileSizeBytes:        input.FileSizeBytes,
+		Caption:              input.Caption,
+		CreatedAt:            now,
+	})
+	if err != nil {
+		if errors.Is(err, ErrBatchNotCollecting) {
+			s.logger.LogAttrs(ctx, slog.LevelInfo, "batch item append rejected",
+				append(attrs, slog.String("reason", "batch_session_not_collecting"), slog.Int64("relay_id", batch.ID))...,
+			)
+			return AppendBatchItemResult{}, ErrBatchSessionNotFound
+		}
+		if errors.Is(err, ErrBatchItemLimit) {
+			s.logger.LogAttrs(ctx, slog.LevelInfo, "batch item append rejected",
+				append(attrs,
+					slog.String("reason", "batch_item_limit"),
+					slog.Int64("relay_id", batch.ID),
+					slog.Int("max_batch_items", s.limits.MaxBatchItems),
+				)...,
+			)
+			return AppendBatchItemResult{}, err
+		}
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch item append failed",
+			append(attrs, slog.String("stage", "persist_batch_item"), slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+		)
+		return AppendBatchItemResult{}, err
+	}
+
+	if created {
+		session.ItemCount = item.ItemOrder
+	} else {
+		items, err := s.store.ListRelayItemsByRelayID(ctx, batch.ID)
+		if err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelError, "batch item append failed",
+				append(attrs, slog.String("stage", "list_batch_items"), slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+			)
+			return AppendBatchItemResult{}, err
+		}
+		session.ItemCount = len(items)
+	}
+	session.LastActivityAt = now
+	mergedSession, err := s.cache.MergeBatchUploadSession(ctx, session, s.limits.BatchSessionTTL)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch item append failed",
+			append(attrs, slog.String("stage", "persist_session"), slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+		)
+		return AppendBatchItemResult{}, err
+	}
+	if mergedSession.RelayID == session.RelayID {
+		session = mergedSession
+	}
+
+	level := slog.LevelInfo
+	message := "batch item appended"
+	if !created {
+		message = "batch item append deduplicated"
+	}
+	s.logger.LogAttrs(ctx, level, message,
+		append(attrs,
+			slog.Int64("relay_id", batch.ID),
+			slog.Int64("item_id", item.ID),
+			slog.Int("item_count", session.ItemCount),
+			slog.Bool("created", created),
+		)...,
+	)
+	return AppendBatchItemResult{
+		Relay:      batch,
+		Item:       item,
+		ItemCount:  session.ItemCount,
+		Duplicated: !created,
+	}, nil
+}
+
+func (s *Service) FinishBatchUpload(ctx context.Context, input FinishBatchUploadInput) (FinishBatchUploadResult, error) {
+	now := s.clock.Now().UTC()
+	attrs := batchSessionAttrs(input.UploaderUserID, input.UploaderChatID)
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload finish requested", attrs...)
+
+	session, ok, err := s.cache.GetBatchUploadSession(ctx, input.UploaderChatID)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload finish failed", append(attrs, slog.Any("error", err))...)
+		return FinishBatchUploadResult{}, err
+	}
+	if !ok {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload finish rejected",
+			append(attrs, slog.String("reason", "batch_session_not_found"))...,
+		)
+		return FinishBatchUploadResult{}, ErrBatchSessionNotFound
+	}
+
+	batch, err := s.store.GetRelayByID(ctx, session.RelayID)
+	if errors.Is(err, ErrRelayNotFound) {
+		_ = s.cache.DeleteBatchUploadSession(ctx, input.UploaderChatID)
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload finish rejected",
+			append(attrs, slog.String("reason", "batch_session_not_found"))...,
+		)
+		return FinishBatchUploadResult{}, ErrBatchSessionNotFound
+	}
+	if err != nil {
+		return FinishBatchUploadResult{}, err
+	}
+	if batch.Status == RelayStatusReady {
+		items, err := s.store.ListRelayItemsByRelayID(ctx, batch.ID)
+		if err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelError, "batch upload finish failed",
+				append(attrs, slog.String("stage", "list_batch_items"), slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+			)
+			return FinishBatchUploadResult{}, err
+		}
+		if ttl := batch.ExpiresAt.Sub(now); ttl > 0 {
+			if err := s.cache.SetRelayIDByCodeHash(ctx, batch.CodeHash, batch.ID, ttl); err != nil {
+				s.logger.LogAttrs(ctx, slog.LevelWarn, "relay cache warm failed",
+					append(attrs, slog.Int64("relay_id", batch.ID), slog.String("code_hint", batch.CodeHint), slog.Any("error", err))...,
+				)
+			}
+		}
+		if err := s.cache.DeleteBatchUploadSession(ctx, input.UploaderChatID); err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "batch session cleanup failed",
+				append(attrs, slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+			)
+		}
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload finish deduplicated",
+			append(attrs,
+				slog.Int64("relay_id", batch.ID),
+				slog.String("code_hint", batch.CodeHint),
+				slog.Int("item_count", len(items)),
+				slog.Time("expires_at", batch.ExpiresAt),
+			)...,
+		)
+		return FinishBatchUploadResult{
+			Relay:     batch,
+			Code:      batch.CodeValue,
+			ExpiresAt: batch.ExpiresAt,
+			ItemCount: len(items),
+		}, nil
+	}
+	if batch.Status != RelayStatusCollecting {
+		_ = s.cache.DeleteBatchUploadSession(ctx, input.UploaderChatID)
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload finish rejected",
+			append(attrs, slog.String("reason", "batch_session_not_found"))...,
+		)
+		return FinishBatchUploadResult{}, ErrBatchSessionNotFound
+	}
+
+	items, err := s.store.ListRelayItemsByRelayID(ctx, batch.ID)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload finish failed",
+			append(attrs, slog.String("stage", "list_batch_items"), slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+		)
+		return FinishBatchUploadResult{}, err
+	}
+	if len(items) == 0 {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload finish rejected",
+			append(attrs, slog.String("reason", "batch_session_empty"), slog.Int64("relay_id", batch.ID))...,
+		)
+		return FinishBatchUploadResult{}, ErrBatchSessionEmpty
+	}
+
+	count, err := s.store.CountActiveRelaysByUploader(ctx, input.UploaderUserID, now)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload finish failed",
+			append(attrs, slog.String("stage", "count_active_relays"), slog.Any("error", err))...,
+		)
+		return FinishBatchUploadResult{}, err
+	}
+
+	deduplicated := false
+	if count >= s.limits.MaxActiveRelays {
+		existing, getErr := s.store.GetRelayByID(ctx, batch.ID)
+		switch {
+		case getErr == nil && existing.Status == RelayStatusReady:
+			batch = existing
+			deduplicated = true
+		case getErr != nil && !errors.Is(getErr, ErrRelayNotFound):
+			s.logger.LogAttrs(ctx, slog.LevelError, "batch upload finish failed",
+				append(attrs, slog.String("stage", "recheck_batch_after_limit"), slog.Int64("relay_id", batch.ID), slog.Any("error", getErr))...,
+			)
+			return FinishBatchUploadResult{}, getErr
+		default:
+			s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload finish rejected",
+				append(attrs,
+					slog.String("reason", "too_many_active_relays"),
+					slog.Int64("active_relays", count),
+					slog.Int64("active_relays_limit", s.limits.MaxActiveRelays),
+				)...,
+			)
+			return FinishBatchUploadResult{}, ErrTooManyRelays
+		}
+	}
+
+	if !deduplicated {
+		displayCode, generatedCodeHash, codeHint, err := s.codes.Generate()
+		if err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelError, "batch upload finish failed",
+				append(attrs, slog.String("stage", "generate_code"), slog.Any("error", err))...,
+			)
+			return FinishBatchUploadResult{}, err
+		}
+
+		expiresAt := now.Add(s.limits.DefaultTTL)
+		relayID := batch.ID
+		batch, err = s.store.FinalizeRelayBatch(ctx, FinalizeRelayBatchParams{
+			RelayID:   relayID,
+			CodeValue: displayCode,
+			CodeHash:  generatedCodeHash,
+			CodeHint:  codeHint,
+			ExpiresAt: expiresAt,
+			UpdatedAt: now,
+		})
+		if err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelError, "batch upload finish failed",
+				append(attrs, slog.String("stage", "finalize_batch"), slog.Int64("relay_id", relayID), slog.Any("error", err))...,
+			)
+			return FinishBatchUploadResult{}, err
+		}
+		deduplicated = batch.CodeHash != generatedCodeHash
+	}
+
+	if ttl := batch.ExpiresAt.Sub(now); ttl > 0 {
+		if err := s.cache.SetRelayIDByCodeHash(ctx, batch.CodeHash, batch.ID, ttl); err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "relay cache warm failed",
+				append(attrs, slog.Int64("relay_id", batch.ID), slog.String("code_hint", batch.CodeHint), slog.Any("error", err))...,
+			)
+		}
+	}
+	if err := s.cache.DeleteBatchUploadSession(ctx, input.UploaderChatID); err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "batch session cleanup failed",
+			append(attrs, slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+		)
+	}
+
+	message := "batch upload finished"
+	if deduplicated {
+		message = "batch upload finish deduplicated"
+	}
+	s.logger.LogAttrs(ctx, slog.LevelInfo, message,
+		append(attrs,
+			slog.Int64("relay_id", batch.ID),
+			slog.String("code_hint", batch.CodeHint),
+			slog.Int("item_count", len(items)),
+			slog.Time("expires_at", batch.ExpiresAt),
+		)...,
+	)
+	return FinishBatchUploadResult{
+		Relay:     batch,
+		Code:      batch.CodeValue,
+		ExpiresAt: batch.ExpiresAt,
+		ItemCount: len(items),
+	}, nil
+}
+
+func (s *Service) CancelBatchUpload(ctx context.Context, input CancelBatchUploadInput) (CancelBatchUploadResult, error) {
+	attrs := batchSessionAttrs(input.UploaderUserID, input.UploaderChatID)
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload cancel requested", attrs...)
+
+	_, batch, err := s.getCollectingBatchSession(ctx, input.UploaderChatID)
+	if err != nil {
+		if errors.Is(err, ErrBatchSessionNotFound) {
+			s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload cancel rejected",
+				append(attrs, slog.String("reason", "batch_session_not_found"))...,
+			)
+		}
+		return CancelBatchUploadResult{}, err
+	}
+
+	items, err := s.store.ListRelayItemsByRelayID(ctx, batch.ID)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload cancel failed",
+			append(attrs, slog.String("stage", "list_batch_items"), slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+		)
+		return CancelBatchUploadResult{}, err
+	}
+
+	if err := s.store.DeleteRelay(ctx, batch.ID); err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload cancel failed",
+			append(attrs, slog.String("stage", "delete_batch"), slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+		)
+		return CancelBatchUploadResult{}, err
+	}
+	if err := s.cache.DeleteBatchUploadSession(ctx, input.UploaderChatID); err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "batch session cleanup failed",
+			append(attrs, slog.Int64("relay_id", batch.ID), slog.Any("error", err))...,
+		)
+	}
+
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "batch upload canceled",
+		append(attrs, slog.Int64("relay_id", batch.ID), slog.Int("item_count", len(items)))...,
+	)
+	return CancelBatchUploadResult{
+		RelayID:   batch.ID,
+		ItemCount: len(items),
 	}, nil
 }
 
@@ -248,6 +640,29 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 			)...,
 		)
 		return ClaimRelayResult{}, err
+	}
+
+	items, err := s.store.ListRelayItemsByRelayID(ctx, item.ID)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "relay claim failed",
+			append(attrs,
+				slog.String("stage", "list_relay_items"),
+				slog.Int64("relay_id", item.ID),
+				slog.Any("error", err),
+			)...,
+		)
+		return ClaimRelayResult{}, err
+	}
+	if len(items) == 0 {
+		missingItemsErr := errors.New("relay items missing")
+		s.logger.LogAttrs(ctx, slog.LevelError, "relay claim failed",
+			append(attrs,
+				slog.String("stage", "list_relay_items"),
+				slog.Int64("relay_id", item.ID),
+				slog.Any("error", missingItemsErr),
+			)...,
+		)
+		return ClaimRelayResult{}, missingItemsErr
 	}
 
 	delivery, created, err := s.store.CreateDelivery(ctx, CreateDeliveryParams{
@@ -322,7 +737,7 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 		)...,
 	)
 
-	method, outMessageID, err := s.sender.CopyOrResend(ctx, item, input.ClaimerChatID)
+	method, outMessageID, err := s.sender.Deliver(ctx, item, items, input.ClaimerChatID)
 	if err != nil {
 		var senderErr SenderError
 		switch {
@@ -470,6 +885,9 @@ func (s *Service) lookupRelay(ctx context.Context, codeHash string, now time.Tim
 				)
 				return Relay{}, ErrRelayExpired
 			}
+			if item.Status != RelayStatusReady {
+				return Relay{}, ErrRelayNotFound
+			}
 			return item, nil
 		}
 		if !errors.Is(err, ErrRelayNotFound) {
@@ -500,8 +918,11 @@ func (s *Service) lookupRelay(ctx context.Context, codeHash string, now time.Tim
 		)
 		return Relay{}, ErrRelayExpired
 	}
+	if item.Status != RelayStatusReady {
+		return Relay{}, ErrRelayNotFound
+	}
 
-	ttl := time.Until(item.ExpiresAt)
+	ttl := item.ExpiresAt.Sub(now)
 	if ttl > 0 {
 		if err := s.cache.SetRelayIDByCodeHash(ctx, codeHash, item.ID, ttl); err != nil {
 			s.logger.LogAttrs(ctx, slog.LevelWarn, "relay cache warm failed",
@@ -530,6 +951,10 @@ func (s *Service) PurgeExpiredDeliveries(ctx context.Context) (int64, error) {
 	return s.store.DeleteExpiredDeliveriesBefore(ctx, s.clock.Now().UTC().Add(-s.limits.ExpiredDeliveryPurge))
 }
 
+func (s *Service) CleanupExpiredBatchSessions(ctx context.Context) (int64, error) {
+	return s.store.DeleteCollectingRelaysBefore(ctx, s.clock.Now().UTC().Add(-s.limits.BatchSessionTTL))
+}
+
 func (s *Service) isForbiddenExtension(fileName string) bool {
 	if fileName == "" || len(s.limits.ForbiddenExtensions) == 0 {
 		return false
@@ -540,6 +965,71 @@ func (s *Service) isForbiddenExtension(fileName string) bool {
 	}
 	_, blocked := s.limits.ForbiddenExtensions[ext]
 	return blocked
+}
+
+func (s *Service) getCollectingBatchSession(ctx context.Context, chatID int64) (BatchUploadSession, Relay, error) {
+	session, ok, err := s.cache.GetBatchUploadSession(ctx, chatID)
+	if err != nil {
+		return BatchUploadSession{}, Relay{}, err
+	}
+	if !ok {
+		return BatchUploadSession{}, Relay{}, ErrBatchSessionNotFound
+	}
+
+	batch, err := s.store.GetRelayByID(ctx, session.RelayID)
+	if errors.Is(err, ErrRelayNotFound) {
+		_ = s.cache.DeleteBatchUploadSession(ctx, chatID)
+		return BatchUploadSession{}, Relay{}, ErrBatchSessionNotFound
+	}
+	if err != nil {
+		return BatchUploadSession{}, Relay{}, err
+	}
+	if batch.Status != RelayStatusCollecting {
+		_ = s.cache.DeleteBatchUploadSession(ctx, chatID)
+		return BatchUploadSession{}, Relay{}, ErrBatchSessionNotFound
+	}
+	return session, batch, nil
+}
+
+func (s *Service) validateUploadInput(ctx context.Context, userID int64, mediaKind MediaKind, fileName string, fileSizeBytes int64, attrs []slog.Attr) error {
+	if !isSupportedMedia(mediaKind) {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "relay create rejected", append(attrs, slog.String("reason", "unsupported_media"))...)
+		return ErrUnsupportedMedia
+	}
+	if fileSizeBytes > s.limits.MaxFileBytes {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "relay create rejected",
+			append(attrs,
+				slog.String("reason", "file_too_large"),
+				slog.Int64("file_size_bytes", fileSizeBytes),
+				slog.Int64("max_file_bytes", s.limits.MaxFileBytes),
+			)...,
+		)
+		return ErrFileTooLarge
+	}
+	if s.isForbiddenExtension(fileName) {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "relay create rejected",
+			append(attrs,
+				slog.String("reason", "forbidden_extension"),
+				slog.String("file_ext", strings.ToLower(path.Ext(fileName))),
+			)...,
+		)
+		return ErrForbiddenExtension
+	}
+	if allowed, err := s.cache.AllowUpload(ctx, userID); err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "relay create failed",
+			append(attrs,
+				slog.String("stage", "allow_upload"),
+				slog.Any("error", err),
+			)...,
+		)
+		return err
+	} else if !allowed {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "relay create rejected",
+			append(attrs, slog.String("reason", "upload_rate_limited"))...,
+		)
+		return ErrUploadRateLimited
+	}
+	return nil
 }
 
 func (s *Service) badCode(ctx context.Context, input ClaimRelayInput, err error) error {
@@ -571,6 +1061,13 @@ func createRelayAttrs(input CreateRelayInput) []slog.Attr {
 		slog.Int("source_message_id", input.SourceMessageID),
 		slog.String("media_kind", string(input.MediaKind)),
 		slog.Int64("file_size_bytes", input.FileSizeBytes),
+	}
+}
+
+func batchSessionAttrs(userID, chatID int64) []slog.Attr {
+	return []slog.Attr{
+		slog.Int64("uploader_user_id", userID),
+		slog.Int64("uploader_chat_id", chatID),
 	}
 }
 

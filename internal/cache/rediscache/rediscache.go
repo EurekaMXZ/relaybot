@@ -2,11 +2,14 @@ package rediscache
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"relaybot/internal/relay"
 )
 
 type Options struct {
@@ -105,6 +108,82 @@ func (c *Cache) MarkSeenUpdate(ctx context.Context, updateID int64) (bool, error
 	return c.client.SetNX(ctx, updateKey(updateID), "1", c.options.SeenUpdateTTL).Result()
 }
 
+func (c *Cache) GetBatchUploadSession(ctx context.Context, chatID int64) (relay.BatchUploadSession, bool, error) {
+	value, err := c.client.Get(ctx, batchSessionKey(chatID)).Result()
+	if err == redis.Nil {
+		return relay.BatchUploadSession{}, false, nil
+	}
+	if err != nil {
+		return relay.BatchUploadSession{}, false, err
+	}
+
+	var session relay.BatchUploadSession
+	if err := json.Unmarshal([]byte(value), &session); err != nil {
+		return relay.BatchUploadSession{}, false, err
+	}
+	return session, true, nil
+}
+
+func (c *Cache) SetBatchUploadSession(ctx context.Context, session relay.BatchUploadSession, ttl time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	body, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+	return c.client.Set(ctx, batchSessionKey(session.UploaderChatID), body, ttl).Err()
+}
+
+func (c *Cache) MergeBatchUploadSession(ctx context.Context, session relay.BatchUploadSession, ttl time.Duration) (relay.BatchUploadSession, error) {
+	if ttl <= 0 {
+		return session, nil
+	}
+
+	key := batchSessionKey(session.UploaderChatID)
+	for {
+		merged := session
+		err := c.client.Watch(ctx, func(tx *redis.Tx) error {
+			value, err := tx.Get(ctx, key).Result()
+			switch {
+			case err == nil:
+				var current relay.BatchUploadSession
+				if err := json.Unmarshal([]byte(value), &current); err != nil {
+					return err
+				}
+				if current.RelayID != 0 && current.RelayID != session.RelayID {
+					merged = current
+					return nil
+				}
+				merged = mergeBatchUploadSession(current, session)
+			case err == redis.Nil:
+				merged = session
+			default:
+				return err
+			}
+
+			body, err := json.Marshal(merged)
+			if err != nil {
+				return err
+			}
+
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, body, ttl)
+				return nil
+			})
+			return err
+		}, key)
+		if err == redis.TxFailedErr {
+			continue
+		}
+		return merged, err
+	}
+}
+
+func (c *Cache) DeleteBatchUploadSession(ctx context.Context, chatID int64) error {
+	return c.client.Del(ctx, batchSessionKey(chatID)).Err()
+}
+
 func (c *Cache) Ping(ctx context.Context) error {
 	return c.client.Ping(ctx).Err()
 }
@@ -131,4 +210,32 @@ func sourceUpdateKey(updateID int64) string {
 
 func rateKey(kind string, userID int64) string {
 	return fmt.Sprintf("rl:%s:u:%d", kind, userID)
+}
+
+func batchSessionKey(chatID int64) string {
+	return fmt.Sprintf("batch:session:chat:%d", chatID)
+}
+
+func mergeBatchUploadSession(current, next relay.BatchUploadSession) relay.BatchUploadSession {
+	if current.RelayID == 0 {
+		return next
+	}
+
+	merged := current
+	if merged.UploaderUserID == 0 {
+		merged.UploaderUserID = next.UploaderUserID
+	}
+	if merged.UploaderChatID == 0 {
+		merged.UploaderChatID = next.UploaderChatID
+	}
+	if next.ItemCount > merged.ItemCount {
+		merged.ItemCount = next.ItemCount
+	}
+	if merged.StartedAt.IsZero() || (!next.StartedAt.IsZero() && next.StartedAt.Before(merged.StartedAt)) {
+		merged.StartedAt = next.StartedAt
+	}
+	if next.LastActivityAt.After(merged.LastActivityAt) {
+		merged.LastActivityAt = next.LastActivityAt
+	}
+	return merged
 }
