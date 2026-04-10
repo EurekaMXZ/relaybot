@@ -94,6 +94,60 @@ go run ./cmd/relaybot
 - `/readyz`
 - `/metrics`
 
+## Docker 构建与部署
+
+构建镜像：
+
+```bash
+docker build -t relaybot:latest .
+```
+
+如需在构建阶段配置 HTTP(S) 代理和 Go 模块代理（`GOPROXY`），可传入 build args：
+
+```bash
+docker build \
+  --build-arg HTTP_PROXY='http://127.0.0.1:7890' \
+  --build-arg HTTPS_PROXY='http://127.0.0.1:7890' \
+  --build-arg NO_PROXY='127.0.0.1,localhost,postgres,redis' \
+  --build-arg GOPROXY='https://goproxy.cn,direct' \
+  -t relaybot:latest .
+```
+
+私有模块场景可额外传入：
+
+```bash
+docker build \
+  --build-arg GOPRIVATE='github.com/your-org/*' \
+  --build-arg GONOSUMDB='github.com/your-org/*' \
+  -t relaybot:latest .
+```
+
+运行容器（假设数据库和 Redis 也在 Docker 网络内）：
+
+```bash
+docker run --rm \
+  --name relaybot \
+  --env-file .env \
+  -e PG_DSN='postgres://relaybot:relaybot@postgres:5432/relaybot?sslmode=disable' \
+  -e REDIS_ADDR='redis:6379' \
+  -e HTTP_ADDR=':8080' \
+  -p 8080:8080 \
+  relaybot:latest
+```
+
+使用 Compose 同时启动依赖和 bot：
+
+```bash
+docker compose -f compose.yaml -f compose-app.yaml up -d --build
+```
+
+说明：
+
+- `compose.yaml` 负责 `postgres` 和 `redis`。
+- `compose-app.yaml` 负责构建并运行 `relaybot` 服务。
+- 如果 `.env` 中的 `PG_DSN` / `REDIS_ADDR` 是本机地址（如 `127.0.0.1`），在容器内会被 `compose-app.yaml` 中的服务名配置覆盖为 `postgres` / `redis`。
+- `compose-app.yaml` 会自动读取环境中的 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`、`GOPROXY`、`GOPRIVATE` 等构建参数并传给 Docker build。
+
 ## 使用方式
 
 单文件上传：

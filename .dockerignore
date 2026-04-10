@@ -1,0 +1,17 @@
+.git
+.github
+.codex
+.DS_Store
+.env
+.env.*
+!.env.example
+bin
+dist
+coverage.out
+
+compose*.yaml
+Makefile
+README.md
+LICENSE
+
+**/*_test.go

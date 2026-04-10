@@ -1,0 +1,29 @@
+services:
+  relaybot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        ALL_PROXY: ${ALL_PROXY:-}
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${GOSUMDB:-sum.golang.org}
+        GOPRIVATE: ${GOPRIVATE:-}
+        GONOSUMDB: ${GONOSUMDB:-}
+    image: relaybot:latest
+    env_file:
+      - .env
+    environment:
+      PG_DSN: postgres://relaybot:relaybot@postgres:5432/relaybot?sslmode=disable
+      REDIS_ADDR: redis:6379
+      HTTP_ADDR: :8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
