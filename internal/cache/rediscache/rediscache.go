@@ -231,6 +231,15 @@ func mergeBatchUploadSession(current, next relay.BatchUploadSession) relay.Batch
 	if next.ItemCount > merged.ItemCount {
 		merged.ItemCount = next.ItemCount
 	}
+	if next.ProgressMessageID > 0 {
+		merged.ProgressMessageID = next.ProgressMessageID
+	}
+	if next.LastProgressNotifiedCount > merged.LastProgressNotifiedCount {
+		merged.LastProgressNotifiedCount = next.LastProgressNotifiedCount
+	}
+	if next.LastProgressNotifiedAt.After(merged.LastProgressNotifiedAt) {
+		merged.LastProgressNotifiedAt = next.LastProgressNotifiedAt
+	}
 	if merged.StartedAt.IsZero() || (!next.StartedAt.IsZero() && next.StartedAt.Before(merged.StartedAt)) {
 		merged.StartedAt = next.StartedAt
 	}

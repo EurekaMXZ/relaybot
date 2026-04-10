@@ -244,12 +244,14 @@ func (s *Service) StartBatchUpload(ctx context.Context, input StartBatchUploadIn
 	}
 
 	session = BatchUploadSession{
-		RelayID:        batch.ID,
-		UploaderUserID: input.UploaderUserID,
-		UploaderChatID: input.UploaderChatID,
-		ItemCount:      0,
-		StartedAt:      now,
-		LastActivityAt: now,
+		RelayID:                   batch.ID,
+		UploaderUserID:            input.UploaderUserID,
+		UploaderChatID:            input.UploaderChatID,
+		ItemCount:                 0,
+		ProgressMessageID:         0,
+		LastProgressNotifiedCount: 0,
+		StartedAt:                 now,
+		LastActivityAt:            now,
 	}
 	if err := s.cache.SetBatchUploadSession(ctx, session, s.limits.BatchSessionTTL); err != nil {
 		s.logger.LogAttrs(ctx, slog.LevelError, "batch upload start failed",
@@ -1046,6 +1048,36 @@ func (s *Service) lookupRelay(ctx context.Context, codeHash string, now time.Tim
 
 func (s *Service) MarkSeenUpdate(ctx context.Context, updateID int64) (bool, error) {
 	return s.cache.MarkSeenUpdate(ctx, updateID)
+}
+
+func (s *Service) GetBatchUploadSession(ctx context.Context, uploaderChatID int64) (BatchUploadSession, bool, error) {
+	return s.cache.GetBatchUploadSession(ctx, uploaderChatID)
+}
+
+func (s *Service) UpdateBatchProgress(ctx context.Context, input UpdateBatchProgressInput) error {
+	session, ok, err := s.cache.GetBatchUploadSession(ctx, input.UploaderChatID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrBatchSessionNotFound
+	}
+	if input.RelayID != 0 && session.RelayID != input.RelayID {
+		return ErrBatchSessionNotFound
+	}
+	if input.ProgressMessageID > 0 {
+		session.ProgressMessageID = input.ProgressMessageID
+	}
+	if !input.LastProgressNotifiedAt.IsZero() {
+		session.LastProgressNotifiedAt = input.LastProgressNotifiedAt.UTC()
+	}
+	if input.LastProgressNotifiedCount > 0 {
+		session.LastProgressNotifiedCount = input.LastProgressNotifiedCount
+	}
+	session.LastActivityAt = s.clock.Now().UTC()
+
+	_, err = s.cache.MergeBatchUploadSession(ctx, session, s.limits.BatchSessionTTL)
+	return err
 }
 
 func (s *Service) ExpireReadyRelays(ctx context.Context) (int64, error) {

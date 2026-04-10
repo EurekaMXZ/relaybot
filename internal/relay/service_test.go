@@ -170,6 +170,82 @@ func TestFinishBatchUploadReturnsEmptyError(t *testing.T) {
 	}
 }
 
+func TestUpdateBatchProgressPersistsSessionState(t *testing.T) {
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	var merged BatchUploadSession
+
+	service := NewService(
+		stubStore{},
+		stubCache{
+			getBatchSessionFunc: func(context.Context, int64) (BatchUploadSession, bool, error) {
+				return BatchUploadSession{
+					RelayID:        10,
+					UploaderChatID: 99,
+					ItemCount:      3,
+				}, true, nil
+			},
+			mergeBatchSessionFunc: func(_ context.Context, session BatchUploadSession, _ time.Duration) (BatchUploadSession, error) {
+				merged = session
+				return session, nil
+			},
+		},
+		nil,
+		NewHMACCodeManager("secret"),
+		fixedClock{now: now},
+		Limits{BatchSessionTTL: 30 * time.Minute},
+	)
+
+	err := service.UpdateBatchProgress(context.Background(), UpdateBatchProgressInput{
+		UploaderChatID:            99,
+		RelayID:                   10,
+		ProgressMessageID:         808,
+		LastProgressNotifiedAt:    now,
+		LastProgressNotifiedCount: 3,
+	})
+	if err != nil {
+		t.Fatalf("UpdateBatchProgress() error = %v", err)
+	}
+	if merged.ProgressMessageID != 808 {
+		t.Fatalf("merged progress message id = %d, want 808", merged.ProgressMessageID)
+	}
+	if merged.LastProgressNotifiedCount != 3 {
+		t.Fatalf("merged last progress count = %d, want 3", merged.LastProgressNotifiedCount)
+	}
+	if !merged.LastProgressNotifiedAt.Equal(now) {
+		t.Fatalf("merged last progress time = %v, want %v", merged.LastProgressNotifiedAt, now)
+	}
+	if !merged.LastActivityAt.Equal(now) {
+		t.Fatalf("merged last activity = %v, want %v", merged.LastActivityAt, now)
+	}
+}
+
+func TestUpdateBatchProgressRejectsSessionFromAnotherRelay(t *testing.T) {
+	service := NewService(
+		stubStore{},
+		stubCache{
+			getBatchSessionFunc: func(context.Context, int64) (BatchUploadSession, bool, error) {
+				return BatchUploadSession{
+					RelayID:        10,
+					UploaderChatID: 99,
+				}, true, nil
+			},
+		},
+		nil,
+		NewHMACCodeManager("secret"),
+		fixedClock{now: time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)},
+		Limits{BatchSessionTTL: 30 * time.Minute},
+	)
+
+	err := service.UpdateBatchProgress(context.Background(), UpdateBatchProgressInput{
+		UploaderChatID:    99,
+		RelayID:           11,
+		ProgressMessageID: 808,
+	})
+	if !errors.Is(err, ErrBatchSessionNotFound) {
+		t.Fatalf("UpdateBatchProgress() error = %v, want %v", err, ErrBatchSessionNotFound)
+	}
+}
+
 func TestAppendBatchItemUsesPersistedBatchSizeForSessionCount(t *testing.T) {
 	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
 	var savedSession BatchUploadSession

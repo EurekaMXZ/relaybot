@@ -24,6 +24,9 @@ type Router struct {
 const (
 	pageCallbackPrefix = "rp"
 	pageCallbackNoop   = "rp:noop"
+
+	batchProgressUpdateStep        = 5
+	batchProgressUpdateMinInterval = 2 * time.Second
 )
 
 func NewRouter(logger *slog.Logger) *Router {
@@ -130,12 +133,34 @@ func (r *Router) handleBatchStart(ctx context.Context, b *bot.Bot, logger *slog.
 	}
 
 	requestLogger.Info("batch upload started", slog.Int64("relay_id", result.Relay.ID))
-	r.replyText(ctx, b, msg.Chat.ID, "已开始批量上传。继续发送文件，完成后发送 /batch_done 生成一个共享 code；放弃可发送 /batch_cancel。")
+
+	progressMessageID := r.sendBatchProgressMessage(ctx, b, msg.Chat.ID, formatBatchProgressCollectingText(0))
+	if progressMessageID == 0 {
+		r.replyText(ctx, b, msg.Chat.ID, "已开始批量上传。继续发送文件，完成后发送 /batch_done 生成一个共享 code；放弃可发送 /batch_cancel。")
+		return
+	}
+
+	if err := r.service.UpdateBatchProgress(ctx, relay.UpdateBatchProgressInput{
+		UploaderChatID:    msg.Chat.ID,
+		RelayID:           result.Relay.ID,
+		ProgressMessageID: progressMessageID,
+	}); err != nil {
+		requestLogger.Warn("persist batch progress message failed",
+			slog.Int64("relay_id", result.Relay.ID),
+			slog.Int("progress_message_id", progressMessageID),
+			slog.Any("error", err),
+		)
+	}
 }
 
 func (r *Router) handleBatchDone(ctx context.Context, b *bot.Bot, logger *slog.Logger, msg *models.Message) {
 	requestLogger := logger.With(slog.String("operation", "batch_done"))
 	requestLogger.Info("batch upload finish requested")
+
+	session, _, sessionErr := r.service.GetBatchUploadSession(ctx, msg.Chat.ID)
+	if sessionErr != nil {
+		requestLogger.Warn("load batch session before finish failed", slog.Any("error", sessionErr))
+	}
 
 	result, err := r.service.FinishBatchUpload(ctx, relay.FinishBatchUploadInput{
 		UploaderUserID: msg.From.ID,
@@ -153,12 +178,18 @@ func (r *Router) handleBatchDone(ctx context.Context, b *bot.Bot, logger *slog.L
 		slog.Int("item_count", result.ItemCount),
 		slog.Time("expires_at", result.ExpiresAt),
 	)
+	r.finalizeBatchProgressMessage(ctx, b, requestLogger, msg.Chat.ID, session, result.Relay.ID, formatBatchProgressFinishedText(result.ItemCount))
 	r.replyHTML(ctx, b, msg.Chat.ID, formatBatchFinishSuccessHTML(result))
 }
 
 func (r *Router) handleBatchCancel(ctx context.Context, b *bot.Bot, logger *slog.Logger, msg *models.Message) {
 	requestLogger := logger.With(slog.String("operation", "batch_cancel"))
 	requestLogger.Info("batch upload cancel requested")
+
+	session, _, sessionErr := r.service.GetBatchUploadSession(ctx, msg.Chat.ID)
+	if sessionErr != nil {
+		requestLogger.Warn("load batch session before cancel failed", slog.Any("error", sessionErr))
+	}
 
 	result, err := r.service.CancelBatchUpload(ctx, relay.CancelBatchUploadInput{
 		UploaderUserID: msg.From.ID,
@@ -174,6 +205,7 @@ func (r *Router) handleBatchCancel(ctx context.Context, b *bot.Bot, logger *slog
 		slog.Int64("relay_id", result.RelayID),
 		slog.Int("item_count", result.ItemCount),
 	)
+	r.finalizeBatchProgressMessage(ctx, b, requestLogger, msg.Chat.ID, session, result.RelayID, formatBatchProgressCanceledText(result.ItemCount))
 	r.replyText(ctx, b, msg.Chat.ID, fmt.Sprintf("已取消当前批量上传，会话内的 %d 个文件已丢弃。", result.ItemCount))
 }
 
@@ -207,11 +239,7 @@ func (r *Router) tryAppendBatchItem(ctx context.Context, b *bot.Bot, logger *slo
 			slog.Int("item_count", result.ItemCount),
 			slog.Bool("duplicated", result.Duplicated),
 		)
-		if result.Duplicated {
-			r.replyText(ctx, b, msg.Chat.ID, fmt.Sprintf("这个文件已经在当前批量上传会话中了，当前共 %d 个文件。", result.ItemCount))
-		} else {
-			r.replyText(ctx, b, msg.Chat.ID, fmt.Sprintf("已加入批量上传，当前共 %d 个文件。完成后发送 /batch_done，取消发送 /batch_cancel。", result.ItemCount))
-		}
+		r.updateBatchProgressAfterAppend(ctx, b, requestLogger, msg.Chat.ID, result)
 		return true
 	case errors.Is(err, relay.ErrBatchSessionNotFound):
 		requestLogger.Debug("batch session not found, fallback to single relay upload")
@@ -311,6 +339,118 @@ func (r *Router) replyHTML(ctx context.Context, b *bot.Bot, chatID int64, text s
 	}); err != nil {
 		r.logger.Error("send HTML message failed", slog.Int64("chat_id", chatID), slog.Any("error", err))
 	}
+}
+
+func (r *Router) sendBatchProgressMessage(ctx context.Context, b *bot.Bot, chatID int64, text string) int {
+	resp, err := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID,
+		Text:   text,
+	})
+	if err != nil {
+		r.logger.Warn("send batch progress message failed",
+			slog.Int64("chat_id", chatID),
+			slog.Any("error", err),
+		)
+		return 0
+	}
+	return resp.ID
+}
+
+func (r *Router) updateBatchProgressAfterAppend(ctx context.Context, b *bot.Bot, logger *slog.Logger, chatID int64, result relay.AppendBatchItemResult) {
+	session, ok, err := r.service.GetBatchUploadSession(ctx, chatID)
+	if err != nil {
+		logger.Warn("load batch progress session failed", slog.Any("error", err))
+		return
+	}
+	if !ok || session.RelayID != result.Relay.ID {
+		return
+	}
+	if !shouldNotifyBatchProgress(session, result.ItemCount) {
+		return
+	}
+
+	now := time.Now().UTC()
+	text := formatBatchProgressCollectingText(result.ItemCount)
+	messageID := session.ProgressMessageID
+	if messageID > 0 {
+		if _, err := b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID:    chatID,
+			MessageID: messageID,
+			Text:      text,
+		}); err == nil || isMessageNotModifiedError(err) {
+			r.persistBatchProgressState(ctx, logger, chatID, result.Relay.ID, messageID, result.ItemCount, now)
+			return
+		}
+	}
+
+	messageID = r.sendBatchProgressMessage(ctx, b, chatID, text)
+	if messageID == 0 {
+		return
+	}
+	r.persistBatchProgressState(ctx, logger, chatID, result.Relay.ID, messageID, result.ItemCount, now)
+}
+
+func (r *Router) persistBatchProgressState(ctx context.Context, logger *slog.Logger, chatID, relayID int64, messageID, itemCount int, notifiedAt time.Time) {
+	if err := r.service.UpdateBatchProgress(ctx, relay.UpdateBatchProgressInput{
+		UploaderChatID:            chatID,
+		RelayID:                   relayID,
+		ProgressMessageID:         messageID,
+		LastProgressNotifiedAt:    notifiedAt,
+		LastProgressNotifiedCount: itemCount,
+	}); err != nil {
+		logger.Warn("persist batch progress state failed",
+			slog.Int64("relay_id", relayID),
+			slog.Int("progress_message_id", messageID),
+			slog.Int("item_count", itemCount),
+			slog.Any("error", err),
+		)
+	}
+}
+
+func (r *Router) finalizeBatchProgressMessage(ctx context.Context, b *bot.Bot, logger *slog.Logger, chatID int64, session relay.BatchUploadSession, relayID int64, text string) {
+	if session.ProgressMessageID == 0 || session.RelayID != relayID {
+		return
+	}
+	if _, err := b.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:    chatID,
+		MessageID: session.ProgressMessageID,
+		Text:      text,
+	}); err != nil && !isMessageNotModifiedError(err) {
+		logger.Warn("finalize batch progress message failed",
+			slog.Int64("relay_id", relayID),
+			slog.Int("progress_message_id", session.ProgressMessageID),
+			slog.Any("error", err),
+		)
+	}
+}
+
+func shouldNotifyBatchProgress(session relay.BatchUploadSession, itemCount int) bool {
+	if itemCount <= session.LastProgressNotifiedCount {
+		return false
+	}
+	if itemCount == 1 || itemCount%batchProgressUpdateStep == 0 {
+		return true
+	}
+	if session.LastProgressNotifiedAt.IsZero() {
+		return true
+	}
+	return time.Since(session.LastProgressNotifiedAt) >= batchProgressUpdateMinInterval
+}
+
+func isMessageNotModifiedError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "message is not modified")
+}
+
+func formatBatchProgressCollectingText(itemCount int) string {
+	return fmt.Sprintf("批量上传进行中：当前 %d 个文件。\n继续发送文件，完成后发送 /batch_done，放弃发送 /batch_cancel。", itemCount)
+}
+
+func formatBatchProgressFinishedText(itemCount int) string {
+	return fmt.Sprintf("批量上传已完成：共 %d 个文件，code 已生成。", itemCount)
+}
+
+func formatBatchProgressCanceledText(itemCount int) string {
+	return fmt.Sprintf("批量上传已取消：会话内的 %d 个文件已丢弃。", itemCount)
 }
 
 func formatCreateSuccessHTML(result relay.CreateRelayResult) string {

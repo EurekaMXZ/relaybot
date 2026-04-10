@@ -75,12 +75,15 @@ type RelayItem struct {
 }
 
 type BatchUploadSession struct {
-	RelayID        int64
-	UploaderUserID int64
-	UploaderChatID int64
-	ItemCount      int
-	StartedAt      time.Time
-	LastActivityAt time.Time
+	RelayID                   int64
+	UploaderUserID            int64
+	UploaderChatID            int64
+	ItemCount                 int
+	ProgressMessageID         int
+	LastProgressNotifiedAt    time.Time
+	LastProgressNotifiedCount int
+	StartedAt                 time.Time
+	LastActivityAt            time.Time
 }
 
 type Delivery struct {
@@ -180,6 +183,14 @@ type FinishBatchUploadInput struct {
 type CancelBatchUploadInput struct {
 	UploaderUserID int64
 	UploaderChatID int64
+}
+
+type UpdateBatchProgressInput struct {
+	UploaderChatID            int64
+	RelayID                   int64
+	ProgressMessageID         int
+	LastProgressNotifiedAt    time.Time
+	LastProgressNotifiedCount int
 }
 
 type StartBatchUploadResult struct {
