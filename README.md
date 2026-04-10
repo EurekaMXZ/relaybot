@@ -60,6 +60,7 @@ docker compose up -d
 - `postgres_data` 挂载到 `/var/lib/postgresql/data`
 - `redis_data` 挂载到 `/data`
 - `redis` 额外开启了 AOF（`appendonly yes`），降低容器重建后的数据丢失风险
+- 宿主机端口可通过环境变量覆盖：`HOST_POSTGRES_PORT`、`HOST_REDIS_PORT`
 
 查看卷：
 
@@ -145,7 +146,10 @@ docker compose -f compose.yaml -f compose-app.yaml up -d --build
 
 - `compose.yaml` 负责 `postgres` 和 `redis`。
 - `compose-app.yaml` 负责构建并运行 `relaybot` 服务。
-- 如果 `.env` 中的 `PG_DSN` / `REDIS_ADDR` 是本机地址（如 `127.0.0.1`），在容器内会被 `compose-app.yaml` 中的服务名配置覆盖为 `postgres` / `redis`。
+- `compose-app.yaml` 默认使用容器网络地址：`postgres` / `redis`。可通过 `COMPOSE_PG_DSN`、`COMPOSE_REDIS_ADDR` 覆盖。
+- 宿主机端口映射由 `HOST_HTTP_PORT` 控制（默认 `8080`）。仅修改 `HTTP_ADDR` 不会改变宿主机映射端口。
+- 容器内监听端口由 `CONTAINER_HTTP_PORT` 控制（默认 `8080`）。
+- 如需显式覆盖容器内监听地址，可使用 `COMPOSE_HTTP_ADDR`。
 - `compose-app.yaml` 会自动读取环境中的 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`、`GOPROXY`、`GOPRIVATE` 等构建参数并传给 Docker build。
 
 ## 使用方式

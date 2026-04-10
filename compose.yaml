@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: relaybot
       POSTGRES_PASSWORD: relaybot
     ports:
-      - "5432:5432"
+      - "${HOST_POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,7 +19,7 @@ services:
     image: redis:7
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "${HOST_REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
