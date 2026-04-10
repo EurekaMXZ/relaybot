@@ -21,6 +21,8 @@ type deliverySegment struct {
 	items []relay.RelayItem
 }
 
+const maxDeliveryPageItems = 10
+
 func NewSender() *Sender {
 	return &Sender{logger: slog.Default().With("component", "telegram_sender")}
 }
@@ -30,39 +32,49 @@ func (s *Sender) Bind(b *bot.Bot) {
 }
 
 func (s *Sender) Deliver(ctx context.Context, batch relay.Relay, items []relay.RelayItem, targetChatID int64) (relay.DeliveryMethod, int, error) {
-	logger := s.batchDeliveryLogger(batch, items, targetChatID)
-	logger.Info("telegram delivery started")
+	return s.DeliverPage(ctx, batch, relay.DeliveryPage{
+		Index: 1,
+		Total: 1,
+		Items: items,
+	}, targetChatID)
+}
 
-	if len(items) == 0 {
+func (s *Sender) DeliverPage(ctx context.Context, batch relay.Relay, page relay.DeliveryPage, targetChatID int64) (relay.DeliveryMethod, int, error) {
+	logger := s.batchDeliveryLogger(batch, page.Items, targetChatID).With(
+		slog.Int("page_index", page.Index),
+		slog.Int("page_total", page.Total),
+	)
+	logger.Info("telegram page delivery started")
+
+	if len(page.Items) == 0 {
 		err := classifySendError(relay.ErrRelayNotFound)
-		logDeliveryError(logger, "telegram delivery failed", relay.DeliveryMethodSendBatch, err, false)
+		logDeliveryError(logger, "telegram page delivery failed", relay.DeliveryMethodSendBatch, err, false)
 		return relay.DeliveryMethodSendBatch, 0, err
 	}
 
-	if len(items) == 1 {
-		method, messageID, err := s.deliverSingle(ctx, batch, items[0], targetChatID)
+	if len(page.Items) == 1 {
+		method, messageID, err := s.deliverSingle(ctx, batch, page.Items[0], targetChatID)
 		if err != nil {
-			logDeliveryError(logger, "telegram delivery failed", method, err, false)
+			logDeliveryError(logger, "telegram page delivery failed", method, err, false)
 			return method, 0, err
 		}
-		logger.Info("telegram delivery completed",
+		logger.Info("telegram page delivery completed",
 			slog.String("delivery_method", string(method)),
 			slog.Int("out_message_id", messageID),
 		)
 		return method, messageID, nil
 	}
 
-	segments := buildDeliverySegments(items)
 	firstMessageID := 0
-	for index, segment := range segments {
-		segmentLogger := logger.With(
-			slog.Int("segment_index", index),
-			slog.Int("segment_item_count", len(segment.items)),
+	pageChunks := splitPageItems(page.Items, maxDeliveryPageItems)
+	for chunkIndex, chunkItems := range pageChunks {
+		chunkLogger := logger.With(
+			slog.Int("chunk_index", chunkIndex),
+			slog.Int("chunk_item_count", len(chunkItems)),
 		)
-
-		messageID, err := s.deliverSegment(ctx, batch, segment.items, targetChatID, segmentLogger)
+		messageID, err := s.deliverChunk(ctx, batch, chunkItems, targetChatID, chunkLogger)
 		if err != nil {
-			logDeliveryError(segmentLogger, "telegram batch segment failed", relay.DeliveryMethodSendBatch, err, false)
+			logDeliveryError(chunkLogger, "telegram page chunk failed", relay.DeliveryMethodSendBatch, err, false)
 			return relay.DeliveryMethodSendBatch, 0, err
 		}
 		if firstMessageID == 0 {
@@ -70,23 +82,21 @@ func (s *Sender) Deliver(ctx context.Context, batch relay.Relay, items []relay.R
 		}
 	}
 
-	logger.Info("telegram delivery completed",
+	logger.Info("telegram page delivery completed",
 		slog.String("delivery_method", string(relay.DeliveryMethodSendBatch)),
 		slog.Int("out_message_id", firstMessageID),
 	)
 	return relay.DeliveryMethodSendBatch, firstMessageID, nil
 }
 
-func (s *Sender) deliverSegment(ctx context.Context, batch relay.Relay, items []relay.RelayItem, targetChatID int64, logger *slog.Logger) (int, error) {
+func (s *Sender) deliverChunk(ctx context.Context, batch relay.Relay, items []relay.RelayItem, targetChatID int64, logger *slog.Logger) (int, error) {
 	if len(items) == 1 {
 		_, messageID, err := s.deliverSingle(ctx, batch, items[0], targetChatID)
 		return messageID, err
 	}
-
 	if canSendAsMediaGroup(items) {
 		return s.sendMediaGroup(ctx, items, targetChatID, logger)
 	}
-
 	firstMessageID := 0
 	for _, item := range items {
 		_, messageID, err := s.deliverSingle(ctx, batch, item, targetChatID)
@@ -102,19 +112,6 @@ func (s *Sender) deliverSegment(ctx context.Context, batch relay.Relay, items []
 
 func (s *Sender) deliverSingle(ctx context.Context, batch relay.Relay, item relay.RelayItem, targetChatID int64) (relay.DeliveryMethod, int, error) {
 	logger := s.itemDeliveryLogger(batch, item, targetChatID)
-
-	if messageID, err := s.copyMessage(ctx, batch, item, targetChatID); err == nil {
-		logger.Info("telegram delivery completed",
-			slog.String("delivery_method", string(relay.DeliveryMethodCopyMessage)),
-			slog.Int("out_message_id", messageID),
-		)
-		return relay.DeliveryMethodCopyMessage, messageID, nil
-	} else if !shouldFallbackAfterCopyError(err) {
-		logDeliveryError(logger, "telegram copy message finished with unknown result", relay.DeliveryMethodCopyMessage, err, false)
-		return relay.DeliveryMethodCopyMessage, 0, err
-	} else {
-		logDeliveryError(logger, "telegram copy message failed, fallback to resend", relay.DeliveryMethodCopyMessage, err, true)
-	}
 
 	var (
 		method    relay.DeliveryMethod
@@ -153,44 +150,61 @@ func (s *Sender) deliverSingle(ctx context.Context, batch relay.Relay, item rela
 	return method, messageID, nil
 }
 
-func buildDeliverySegments(items []relay.RelayItem) []deliverySegment {
-	segments := make([]deliverySegment, 0, len(items))
-	for index := 0; index < len(items); {
-		item := items[index]
-		if item.MediaGroupID == "" || !isMediaGroupKind(item.MediaKind) {
-			segments = append(segments, deliverySegment{items: []relay.RelayItem{item}})
-			index++
-			continue
-		}
-
-		end := index + 1
-		for end < len(items) && items[end].MediaGroupID == item.MediaGroupID && isMediaGroupKind(items[end].MediaKind) {
-			end++
-		}
-		segments = append(segments, deliverySegment{items: items[index:end]})
-		index = end
+func splitPageItems(items []relay.RelayItem, maxPageItems int) [][]relay.RelayItem {
+	if len(items) == 0 || maxPageItems <= 0 {
+		return nil
 	}
-	return segments
+
+	chunks := make([][]relay.RelayItem, 0, (len(items)+maxPageItems-1)/maxPageItems)
+	for start := 0; start < len(items); start += maxPageItems {
+		end := start + maxPageItems
+		if end > len(items) {
+			end = len(items)
+		}
+		chunks = append(chunks, items[start:end])
+	}
+	return chunks
 }
 
 func canSendAsMediaGroup(items []relay.RelayItem) bool {
 	if len(items) < 2 {
 		return false
 	}
-	groupID := items[0].MediaGroupID
-	if groupID == "" {
+
+	mode := mediaGroupKindMode(items[0].MediaKind)
+	if mode == mediaGroupModeInvalid {
 		return false
 	}
-	for _, item := range items {
-		if item.MediaGroupID != groupID || !isMediaGroupKind(item.MediaKind) {
+
+	for _, item := range items[1:] {
+		nextMode := mediaGroupKindMode(item.MediaKind)
+		if nextMode == mediaGroupModeInvalid || nextMode != mode {
 			return false
 		}
 	}
 	return true
 }
 
-func isMediaGroupKind(kind relay.MediaKind) bool {
-	return kind == relay.MediaKindPhoto || kind == relay.MediaKindVideo
+type mediaGroupMode int
+
+const (
+	mediaGroupModeInvalid mediaGroupMode = iota
+	mediaGroupModeVisual
+	mediaGroupModeAudio
+	mediaGroupModeDocument
+)
+
+func mediaGroupKindMode(kind relay.MediaKind) mediaGroupMode {
+	switch kind {
+	case relay.MediaKindPhoto, relay.MediaKindVideo:
+		return mediaGroupModeVisual
+	case relay.MediaKindAudio:
+		return mediaGroupModeAudio
+	case relay.MediaKindDocument:
+		return mediaGroupModeDocument
+	default:
+		return mediaGroupModeInvalid
+	}
 }
 
 func shouldFallbackAfterCopyError(err error) bool {
@@ -206,23 +220,10 @@ func shouldFallbackAfterCopyError(err error) bool {
 	return true
 }
 
-func (s *Sender) copyMessage(ctx context.Context, batch relay.Relay, item relay.RelayItem, targetChatID int64) (int, error) {
-	resp, err := s.bot.CopyMessage(ctx, &bot.CopyMessageParams{
-		ChatID:     targetChatID,
-		FromChatID: batch.UploaderChatID,
-		MessageID:  item.SourceMessageID,
-	})
-	if err != nil {
-		return 0, classifySendError(err)
-	}
-	return resp.ID, nil
-}
-
 func (s *Sender) sendDocument(ctx context.Context, item relay.RelayItem, targetChatID int64) (int, error) {
 	resp, err := s.bot.SendDocument(ctx, &bot.SendDocumentParams{
 		ChatID:   targetChatID,
 		Document: &models.InputFileString{Data: item.TelegramFileID},
-		Caption:  item.Caption,
 	})
 	if err != nil {
 		return 0, classifySendError(err)
@@ -232,9 +233,8 @@ func (s *Sender) sendDocument(ctx context.Context, item relay.RelayItem, targetC
 
 func (s *Sender) sendPhoto(ctx context.Context, item relay.RelayItem, targetChatID int64) (int, error) {
 	resp, err := s.bot.SendPhoto(ctx, &bot.SendPhotoParams{
-		ChatID:  targetChatID,
-		Photo:   &models.InputFileString{Data: item.TelegramFileID},
-		Caption: item.Caption,
+		ChatID: targetChatID,
+		Photo:  &models.InputFileString{Data: item.TelegramFileID},
 	})
 	if err != nil {
 		return 0, classifySendError(err)
@@ -244,9 +244,8 @@ func (s *Sender) sendPhoto(ctx context.Context, item relay.RelayItem, targetChat
 
 func (s *Sender) sendVideo(ctx context.Context, item relay.RelayItem, targetChatID int64) (int, error) {
 	resp, err := s.bot.SendVideo(ctx, &bot.SendVideoParams{
-		ChatID:  targetChatID,
-		Video:   &models.InputFileString{Data: item.TelegramFileID},
-		Caption: item.Caption,
+		ChatID: targetChatID,
+		Video:  &models.InputFileString{Data: item.TelegramFileID},
 	})
 	if err != nil {
 		return 0, classifySendError(err)
@@ -256,9 +255,8 @@ func (s *Sender) sendVideo(ctx context.Context, item relay.RelayItem, targetChat
 
 func (s *Sender) sendAudio(ctx context.Context, item relay.RelayItem, targetChatID int64) (int, error) {
 	resp, err := s.bot.SendAudio(ctx, &bot.SendAudioParams{
-		ChatID:  targetChatID,
-		Audio:   &models.InputFileString{Data: item.TelegramFileID},
-		Caption: item.Caption,
+		ChatID: targetChatID,
+		Audio:  &models.InputFileString{Data: item.TelegramFileID},
 	})
 	if err != nil {
 		return 0, classifySendError(err)
@@ -268,9 +266,8 @@ func (s *Sender) sendAudio(ctx context.Context, item relay.RelayItem, targetChat
 
 func (s *Sender) sendVoice(ctx context.Context, item relay.RelayItem, targetChatID int64) (int, error) {
 	resp, err := s.bot.SendVoice(ctx, &bot.SendVoiceParams{
-		ChatID:  targetChatID,
-		Voice:   &models.InputFileString{Data: item.TelegramFileID},
-		Caption: item.Caption,
+		ChatID: targetChatID,
+		Voice:  &models.InputFileString{Data: item.TelegramFileID},
 	})
 	if err != nil {
 		return 0, classifySendError(err)
@@ -284,13 +281,19 @@ func (s *Sender) sendMediaGroup(ctx context.Context, items []relay.RelayItem, ta
 		switch item.MediaKind {
 		case relay.MediaKindPhoto:
 			media = append(media, &models.InputMediaPhoto{
-				Media:   item.TelegramFileID,
-				Caption: item.Caption,
+				Media: item.TelegramFileID,
 			})
 		case relay.MediaKindVideo:
 			media = append(media, &models.InputMediaVideo{
-				Media:   item.TelegramFileID,
-				Caption: item.Caption,
+				Media: item.TelegramFileID,
+			})
+		case relay.MediaKindAudio:
+			media = append(media, &models.InputMediaAudio{
+				Media: item.TelegramFileID,
+			})
+		case relay.MediaKindDocument:
+			media = append(media, &models.InputMediaDocument{
+				Media: item.TelegramFileID,
 			})
 		default:
 			return 0, classifySendError(relay.ErrUnsupportedMedia)

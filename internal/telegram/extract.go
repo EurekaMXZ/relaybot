@@ -24,7 +24,7 @@ func ExtractCreateRelayInput(update *models.Update) (relay.CreateRelayInput, boo
 		UploaderUserID:  message.From.ID,
 		UploaderChatID:  message.Chat.ID,
 		SourceMessageID: message.ID,
-		Caption:         message.Caption,
+		Caption:         "",
 	}
 
 	switch {
@@ -127,14 +127,13 @@ func ExtractClaimRelayInputs(update *models.Update) []relay.ClaimRelayInput {
 }
 
 func claimContent(message *models.Message) string {
-	parts := make([]string, 0, 2)
-	if text := strings.TrimSpace(message.Text); text != "" {
-		parts = append(parts, text)
+	if message == nil {
+		return ""
 	}
-	if caption := strings.TrimSpace(message.Caption); caption != "" {
-		parts = append(parts, caption)
+	if message.ForwardOrigin != nil || message.IsAutomaticForward {
+		return ""
 	}
-	return strings.Join(parts, "\n")
+	return strings.TrimSpace(message.Text)
 }
 
 func canonicalClaimCode(raw string) string {

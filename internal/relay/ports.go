@@ -44,7 +44,13 @@ type Cache interface {
 }
 
 type Sender interface {
-	Deliver(ctx context.Context, relay Relay, items []RelayItem, targetChatID int64) (DeliveryMethod, int, error)
+	DeliverPage(ctx context.Context, relay Relay, page DeliveryPage, targetChatID int64) (DeliveryMethod, int, error)
+}
+
+type DeliveryPage struct {
+	Index int
+	Total int
+	Items []RelayItem
 }
 
 type SenderError interface {

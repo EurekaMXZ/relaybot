@@ -689,6 +689,406 @@ func TestFinishBatchUploadReturnsStoredCodeWhenBatchAlreadyReadyBeforeSessionCle
 	}
 }
 
+func TestClaimRelayDeliversInPagesAndMarksSent(t *testing.T) {
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	items := makeClaimRelayItems(12)
+	pages := make([]DeliveryPage, 0, 2)
+	var markSentParams MarkDeliverySentParams
+
+	service := NewService(
+		stubStore{
+			getRelayByCodeHashFunc: func(context.Context, string, time.Time) (Relay, error) {
+				return Relay{
+					ID:             10,
+					Status:         RelayStatusReady,
+					CodeHint:       "ABCD",
+					UploaderChatID: 500,
+					ExpiresAt:      now.Add(time.Hour),
+				}, nil
+			},
+			listRelayItemsByRelayIDFunc: func(context.Context, int64) ([]RelayItem, error) {
+				return items, nil
+			},
+			createDeliveryFunc: func(context.Context, CreateDeliveryParams) (Delivery, bool, error) {
+				return Delivery{
+					ID:      88,
+					RelayID: 10,
+					Status:  DeliveryStatusPending,
+				}, true, nil
+			},
+			markDeliverySentFunc: func(_ context.Context, params MarkDeliverySentParams) error {
+				markSentParams = params
+				return nil
+			},
+		},
+		stubCache{
+			allowClaimFunc: func(context.Context, int64) (bool, error) { return true, nil },
+		},
+		stubSender{
+			deliverPageFunc: func(_ context.Context, _ Relay, page DeliveryPage, targetChatID int64) (DeliveryMethod, int, error) {
+				if targetChatID != 99 {
+					t.Fatalf("DeliverPage() target chat id = %d, want 99", targetChatID)
+				}
+				pages = append(pages, page)
+				return DeliveryMethodSendBatch, 7000 + page.Index, nil
+			},
+		},
+		stubCodeManager{
+			normalizeFunc: func(raw string) (string, error) { return raw, nil },
+			hashFunc:      func(string) string { return "relay-hash" },
+		},
+		fixedClock{now: now},
+		Limits{DefaultTTL: time.Hour},
+	)
+
+	result, err := service.ClaimRelay(context.Background(), ClaimRelayInput{
+		RequestUpdateID: 1,
+		ClaimerUserID:   42,
+		ClaimerChatID:   99,
+		RawCode:         "relaybot_code",
+	})
+	if err != nil {
+		t.Fatalf("ClaimRelay() error = %v", err)
+	}
+	if len(pages) != 1 {
+		t.Fatalf("DeliverPage() call count = %d, want 1", len(pages))
+	}
+	if pages[0].Index != 1 || pages[0].Total != 2 || len(pages[0].Items) != 10 {
+		t.Fatalf("unexpected first page: %+v", pages[0])
+	}
+	if markSentParams.Method != DeliveryMethodSendBatch {
+		t.Fatalf("MarkDeliverySent() method = %q, want %q", markSentParams.Method, DeliveryMethodSendBatch)
+	}
+	if markSentParams.OutMessageID != 7001 {
+		t.Fatalf("MarkDeliverySent() out message id = %d, want 7001", markSentParams.OutMessageID)
+	}
+	if result.Method != DeliveryMethodSendBatch {
+		t.Fatalf("ClaimRelay() method = %q, want %q", result.Method, DeliveryMethodSendBatch)
+	}
+	if result.OutMessageID != 7001 {
+		t.Fatalf("ClaimRelay() out message id = %d, want 7001", result.OutMessageID)
+	}
+	if result.PageIndex != 1 || result.PageTotal != 2 {
+		t.Fatalf("ClaimRelay() page = %d/%d, want 1/2", result.PageIndex, result.PageTotal)
+	}
+}
+
+func TestClaimRelayDuplicatePendingReturnsInProgress(t *testing.T) {
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	senderCalled := false
+
+	service := NewService(
+		stubStore{
+			getRelayByCodeHashFunc: func(context.Context, string, time.Time) (Relay, error) {
+				return Relay{
+					ID:        10,
+					Status:    RelayStatusReady,
+					CodeHint:  "ABCD",
+					ExpiresAt: now.Add(time.Hour),
+				}, nil
+			},
+			listRelayItemsByRelayIDFunc: func(context.Context, int64) ([]RelayItem, error) {
+				return makeClaimRelayItems(2), nil
+			},
+			createDeliveryFunc: func(context.Context, CreateDeliveryParams) (Delivery, bool, error) {
+				return Delivery{
+					ID:      88,
+					RelayID: 10,
+					Status:  DeliveryStatusPending,
+				}, false, nil
+			},
+		},
+		stubCache{
+			allowClaimFunc: func(context.Context, int64) (bool, error) { return true, nil },
+		},
+		stubSender{
+			deliverPageFunc: func(context.Context, Relay, DeliveryPage, int64) (DeliveryMethod, int, error) {
+				senderCalled = true
+				return DeliveryMethodSendBatch, 0, nil
+			},
+		},
+		stubCodeManager{
+			normalizeFunc: func(raw string) (string, error) { return raw, nil },
+			hashFunc:      func(string) string { return "relay-hash" },
+		},
+		fixedClock{now: now},
+		Limits{DefaultTTL: time.Hour},
+	)
+
+	_, err := service.ClaimRelay(context.Background(), ClaimRelayInput{
+		RequestUpdateID: 1,
+		ClaimerUserID:   42,
+		ClaimerChatID:   99,
+		RawCode:         "relaybot_code",
+	})
+	if !errors.Is(err, ErrDeliveryInProgress) {
+		t.Fatalf("ClaimRelay() error = %v, want %v", err, ErrDeliveryInProgress)
+	}
+	if senderCalled {
+		t.Fatal("DeliverPage() should not be called when delivery status is pending and deduplicated")
+	}
+}
+
+func TestClaimRelayUnknownPageResultMarksUnknown(t *testing.T) {
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	items := makeClaimRelayItems(11)
+	var (
+		markUnknownParams MarkDeliveryUnknownParams
+		markFailedCalled  bool
+	)
+
+	service := NewService(
+		stubStore{
+			getRelayByCodeHashFunc: func(context.Context, string, time.Time) (Relay, error) {
+				return Relay{
+					ID:        10,
+					Status:    RelayStatusReady,
+					CodeHint:  "ABCD",
+					ExpiresAt: now.Add(time.Hour),
+				}, nil
+			},
+			listRelayItemsByRelayIDFunc: func(context.Context, int64) ([]RelayItem, error) {
+				return items, nil
+			},
+			createDeliveryFunc: func(context.Context, CreateDeliveryParams) (Delivery, bool, error) {
+				return Delivery{
+					ID:      88,
+					RelayID: 10,
+					Status:  DeliveryStatusPending,
+				}, true, nil
+			},
+			markDeliveryUnknownFunc: func(_ context.Context, params MarkDeliveryUnknownParams) error {
+				markUnknownParams = params
+				return nil
+			},
+			markDeliveryFailedFunc: func(context.Context, MarkDeliveryFailedParams) error {
+				markFailedCalled = true
+				return nil
+			},
+		},
+		stubCache{
+			allowClaimFunc: func(context.Context, int64) (bool, error) { return true, nil },
+		},
+		stubSender{
+			deliverPageFunc: func(_ context.Context, _ Relay, page DeliveryPage, _ int64) (DeliveryMethod, int, error) {
+				return DeliveryMethodSendBatch, 0, &DeliveryError{
+					Method:         DeliveryMethodSendBatch,
+					ErrCode:        "telegram_timeout",
+					ErrDescription: "request timed out",
+					Unknown:        true,
+				}
+			},
+		},
+		stubCodeManager{
+			normalizeFunc: func(raw string) (string, error) { return raw, nil },
+			hashFunc:      func(string) string { return "relay-hash" },
+		},
+		fixedClock{now: now},
+		Limits{DefaultTTL: time.Hour},
+	)
+
+	_, err := service.ClaimRelay(context.Background(), ClaimRelayInput{
+		RequestUpdateID: 1,
+		ClaimerUserID:   42,
+		ClaimerChatID:   99,
+		RawCode:         "relaybot_code",
+	})
+	if err == nil {
+		t.Fatal("ClaimRelay() expected error on unknown delivery result")
+	}
+	if markUnknownParams.ErrorCode != "telegram_timeout" {
+		t.Fatalf("MarkDeliveryUnknown() error code = %q, want telegram_timeout", markUnknownParams.ErrorCode)
+	}
+	if markUnknownParams.ErrorDesc != "request timed out" {
+		t.Fatalf("MarkDeliveryUnknown() error desc = %q, want request timed out", markUnknownParams.ErrorDesc)
+	}
+	if markFailedCalled {
+		t.Fatal("MarkDeliveryFailed() should not be called for unknown result")
+	}
+}
+
+func TestClaimRelayFailedPageResultMarksFailed(t *testing.T) {
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	var (
+		markFailedParams  MarkDeliveryFailedParams
+		markUnknownCalled bool
+	)
+
+	service := NewService(
+		stubStore{
+			getRelayByCodeHashFunc: func(context.Context, string, time.Time) (Relay, error) {
+				return Relay{
+					ID:        10,
+					Status:    RelayStatusReady,
+					CodeHint:  "ABCD",
+					ExpiresAt: now.Add(time.Hour),
+				}, nil
+			},
+			listRelayItemsByRelayIDFunc: func(context.Context, int64) ([]RelayItem, error) {
+				return makeClaimRelayItems(3), nil
+			},
+			createDeliveryFunc: func(context.Context, CreateDeliveryParams) (Delivery, bool, error) {
+				return Delivery{
+					ID:      88,
+					RelayID: 10,
+					Status:  DeliveryStatusPending,
+				}, true, nil
+			},
+			markDeliveryFailedFunc: func(_ context.Context, params MarkDeliveryFailedParams) error {
+				markFailedParams = params
+				return nil
+			},
+			markDeliveryUnknownFunc: func(context.Context, MarkDeliveryUnknownParams) error {
+				markUnknownCalled = true
+				return nil
+			},
+		},
+		stubCache{
+			allowClaimFunc: func(context.Context, int64) (bool, error) { return true, nil },
+		},
+		stubSender{
+			deliverPageFunc: func(context.Context, Relay, DeliveryPage, int64) (DeliveryMethod, int, error) {
+				return DeliveryMethodSendBatch, 0, &DeliveryError{
+					Method:         DeliveryMethodSendBatch,
+					ErrCode:        "telegram_error",
+					ErrDescription: "bad request",
+					Unknown:        false,
+				}
+			},
+		},
+		stubCodeManager{
+			normalizeFunc: func(raw string) (string, error) { return raw, nil },
+			hashFunc:      func(string) string { return "relay-hash" },
+		},
+		fixedClock{now: now},
+		Limits{DefaultTTL: time.Hour},
+	)
+
+	_, err := service.ClaimRelay(context.Background(), ClaimRelayInput{
+		RequestUpdateID: 1,
+		ClaimerUserID:   42,
+		ClaimerChatID:   99,
+		RawCode:         "relaybot_code",
+	})
+	if err == nil {
+		t.Fatal("ClaimRelay() expected error on delivery failure")
+	}
+	if markFailedParams.ErrorCode != "telegram_error" {
+		t.Fatalf("MarkDeliveryFailed() error code = %q, want telegram_error", markFailedParams.ErrorCode)
+	}
+	if markFailedParams.ErrorDesc != "bad request" {
+		t.Fatalf("MarkDeliveryFailed() error desc = %q, want bad request", markFailedParams.ErrorDesc)
+	}
+	if markUnknownCalled {
+		t.Fatal("MarkDeliveryUnknown() should not be called for definite failure")
+	}
+}
+
+func TestClaimRelayPageSendsRequestedPage(t *testing.T) {
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	items := makeClaimRelayItems(12)
+	calls := 0
+
+	service := NewService(
+		stubStore{
+			getRelayByIDFunc: func(context.Context, int64) (Relay, error) {
+				return Relay{
+					ID:        10,
+					Status:    RelayStatusReady,
+					CodeHint:  "ABCD",
+					ExpiresAt: now.Add(time.Hour),
+				}, nil
+			},
+			listRelayItemsByRelayIDFunc: func(context.Context, int64) ([]RelayItem, error) {
+				return items, nil
+			},
+		},
+		stubCache{},
+		stubSender{
+			deliverPageFunc: func(_ context.Context, _ Relay, page DeliveryPage, targetChatID int64) (DeliveryMethod, int, error) {
+				calls++
+				if targetChatID != 99 {
+					t.Fatalf("DeliverPage() target chat id = %d, want 99", targetChatID)
+				}
+				if page.Index != 2 || page.Total != 2 || len(page.Items) != 2 {
+					t.Fatalf("unexpected page delivered: %+v", page)
+				}
+				return DeliveryMethodSendBatch, 8002, nil
+			},
+		},
+		stubCodeManager{},
+		fixedClock{now: now},
+		Limits{DefaultTTL: time.Hour},
+	)
+
+	result, err := service.ClaimRelayPage(context.Background(), ClaimRelayPageInput{
+		RelayID:       10,
+		PageIndex:     2,
+		ClaimerUserID: 42,
+		ClaimerChatID: 99,
+	})
+	if err != nil {
+		t.Fatalf("ClaimRelayPage() error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("DeliverPage() call count = %d, want 1", calls)
+	}
+	if result.PageIndex != 2 || result.PageTotal != 2 {
+		t.Fatalf("ClaimRelayPage() page = %d/%d, want 2/2", result.PageIndex, result.PageTotal)
+	}
+	if result.OutMessageID != 8002 {
+		t.Fatalf("ClaimRelayPage() out message id = %d, want 8002", result.OutMessageID)
+	}
+}
+
+func TestClaimRelayPageOutOfRange(t *testing.T) {
+	now := time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC)
+	service := NewService(
+		stubStore{
+			getRelayByIDFunc: func(context.Context, int64) (Relay, error) {
+				return Relay{
+					ID:        10,
+					Status:    RelayStatusReady,
+					ExpiresAt: now.Add(time.Hour),
+				}, nil
+			},
+			listRelayItemsByRelayIDFunc: func(context.Context, int64) ([]RelayItem, error) {
+				return makeClaimRelayItems(12), nil
+			},
+		},
+		stubCache{},
+		stubSender{},
+		stubCodeManager{},
+		fixedClock{now: now},
+		Limits{DefaultTTL: time.Hour},
+	)
+
+	_, err := service.ClaimRelayPage(context.Background(), ClaimRelayPageInput{
+		RelayID:       10,
+		PageIndex:     3,
+		ClaimerUserID: 42,
+		ClaimerChatID: 99,
+	})
+	if !errors.Is(err, ErrPageOutOfRange) {
+		t.Fatalf("ClaimRelayPage() error = %v, want %v", err, ErrPageOutOfRange)
+	}
+}
+
+func makeClaimRelayItems(count int) []RelayItem {
+	items := make([]RelayItem, 0, count)
+	for i := 1; i <= count; i++ {
+		items = append(items, RelayItem{
+			ID:              int64(i),
+			RelayID:         10,
+			SourceMessageID: 100 + i,
+			ItemOrder:       i,
+			MediaKind:       MediaKindDocument,
+			TelegramFileID:  "file-id",
+		})
+	}
+	return items
+}
+
 type fixedClock struct {
 	now time.Time
 }
@@ -789,8 +1189,13 @@ type stubStore struct {
 	addRelayItemFunc                func(context.Context, AddRelayItemParams) (RelayItem, bool, error)
 	finalizeRelayBatchFunc          func(context.Context, FinalizeRelayBatchParams) (Relay, error)
 	getRelayByIDFunc                func(context.Context, int64) (Relay, error)
+	getRelayByCodeHashFunc          func(context.Context, string, time.Time) (Relay, error)
 	listRelayItemsByRelayIDFunc     func(context.Context, int64) ([]RelayItem, error)
 	countActiveRelaysByUploaderFunc func(context.Context, int64, time.Time) (int64, error)
+	createDeliveryFunc              func(context.Context, CreateDeliveryParams) (Delivery, bool, error)
+	markDeliverySentFunc            func(context.Context, MarkDeliverySentParams) error
+	markDeliveryFailedFunc          func(context.Context, MarkDeliveryFailedParams) error
+	markDeliveryUnknownFunc         func(context.Context, MarkDeliveryUnknownParams) error
 }
 
 func (stubStore) CreateRelay(context.Context, CreateRelayParams) (Relay, bool, error) {
@@ -833,7 +1238,10 @@ func (stubStore) GetRelayBySourceUpdateID(context.Context, int64) (Relay, error)
 	return Relay{}, ErrRelayNotFound
 }
 
-func (stubStore) GetRelayByCodeHash(context.Context, string, time.Time) (Relay, error) {
+func (s stubStore) GetRelayByCodeHash(ctx context.Context, codeHash string, now time.Time) (Relay, error) {
+	if s.getRelayByCodeHashFunc != nil {
+		return s.getRelayByCodeHashFunc(ctx, codeHash, now)
+	}
 	return Relay{}, ErrRelayNotFound
 }
 
@@ -851,19 +1259,31 @@ func (s stubStore) CountActiveRelaysByUploader(ctx context.Context, uploaderUser
 	return 0, nil
 }
 
-func (stubStore) CreateDelivery(context.Context, CreateDeliveryParams) (Delivery, bool, error) {
+func (s stubStore) CreateDelivery(ctx context.Context, params CreateDeliveryParams) (Delivery, bool, error) {
+	if s.createDeliveryFunc != nil {
+		return s.createDeliveryFunc(ctx, params)
+	}
 	return Delivery{}, false, nil
 }
 
-func (stubStore) MarkDeliverySent(context.Context, MarkDeliverySentParams) error {
+func (s stubStore) MarkDeliverySent(ctx context.Context, params MarkDeliverySentParams) error {
+	if s.markDeliverySentFunc != nil {
+		return s.markDeliverySentFunc(ctx, params)
+	}
 	return nil
 }
 
-func (stubStore) MarkDeliveryFailed(context.Context, MarkDeliveryFailedParams) error {
+func (s stubStore) MarkDeliveryFailed(ctx context.Context, params MarkDeliveryFailedParams) error {
+	if s.markDeliveryFailedFunc != nil {
+		return s.markDeliveryFailedFunc(ctx, params)
+	}
 	return nil
 }
 
-func (stubStore) MarkDeliveryUnknown(context.Context, MarkDeliveryUnknownParams) error {
+func (s stubStore) MarkDeliveryUnknown(ctx context.Context, params MarkDeliveryUnknownParams) error {
+	if s.markDeliveryUnknownFunc != nil {
+		return s.markDeliveryUnknownFunc(ctx, params)
+	}
 	return nil
 }
 
@@ -885,6 +1305,17 @@ func (stubStore) DeleteExpiredDeliveriesBefore(context.Context, time.Time) (int6
 
 func (stubStore) Ping(context.Context) error {
 	return nil
+}
+
+type stubSender struct {
+	deliverPageFunc func(context.Context, Relay, DeliveryPage, int64) (DeliveryMethod, int, error)
+}
+
+func (s stubSender) DeliverPage(ctx context.Context, relay Relay, page DeliveryPage, targetChatID int64) (DeliveryMethod, int, error) {
+	if s.deliverPageFunc != nil {
+		return s.deliverPageFunc(ctx, relay, page, targetChatID)
+	}
+	return DeliveryMethodSendBatch, 0, nil
 }
 
 type stubCodeManager struct {

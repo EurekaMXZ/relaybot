@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,11 @@ type Router struct {
 	logger  *slog.Logger
 	service *relay.Service
 }
+
+const (
+	pageCallbackPrefix = "rp"
+	pageCallbackNoop   = "rp:noop"
+)
 
 func NewRouter(logger *slog.Logger) *Router {
 	return &Router{logger: newRouterLogger(logger)}
@@ -37,6 +43,11 @@ func (r *Router) HandleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		r.logger.Warn("telegram router received nil update")
 		return
 	}
+	if update.CallbackQuery != nil {
+		r.handleCallbackQuery(ctx, b, update.CallbackQuery)
+		return
+	}
+
 	if update.Message == nil {
 		r.logger.Debug("ignore telegram update without message", slog.Int64("update_id", int64(update.ID)))
 		return
@@ -276,6 +287,8 @@ func (r *Router) describeError(err error) string {
 		return "当前没有正在进行的批量上传。发送 /batch_start 开始。"
 	case errors.Is(err, relay.ErrBatchSessionEmpty):
 		return "当前批量上传会话里还没有文件。先发文件，再发送 /batch_done。"
+	case errors.Is(err, relay.ErrPageOutOfRange):
+		return "页码超出范围，请使用按钮翻页。"
 	default:
 		return "处理失败，请稍后重试。"
 	}
@@ -318,7 +331,7 @@ func formatBatchFinishSuccessHTML(result relay.FinishBatchUploadResult) string {
 }
 
 func usageText() string {
-	return "单文件：直接发文件，我会返回一个 relaybot code。\n批量文件：先发 /batch_start，再连续发多个文件，最后发 /batch_done 生成一个共享 code；放弃可发 /batch_cancel。\n领取：把一个或多个 code 发给我，就能取回原文件。"
+	return "单文件：直接发文件，我会返回一个 relaybot code。\n批量文件：先发 /batch_start，再连续发多个文件，最后发 /batch_done 生成一个共享 code；放弃可发 /batch_cancel。\n领取：把一个或多个 code 发给我，就能取回原文件。文件较多时会分页发送，可用按钮翻页。"
 }
 
 func (r *Router) updateLogger(update *models.Update) *slog.Logger {
@@ -352,7 +365,8 @@ func isExpectedTelegramError(err error) bool {
 		errors.Is(err, relay.ErrDeliveryFailed),
 		errors.Is(err, relay.ErrBatchSessionActive),
 		errors.Is(err, relay.ErrBatchSessionNotFound),
-		errors.Is(err, relay.ErrBatchSessionEmpty):
+		errors.Is(err, relay.ErrBatchSessionEmpty),
+		errors.Is(err, relay.ErrPageOutOfRange):
 		return true
 	default:
 		return false
@@ -401,6 +415,7 @@ func (r *Router) handleClaimRelays(ctx context.Context, b *bot.Bot, chatID int64
 				slog.String("delivery_status", string(result.Delivery.Status)),
 				slog.String("delivery_method", string(result.Method)),
 			)
+			r.sendPageNavigator(ctx, b, claim.ClaimerChatID, claim.ClaimerUserID, result.Relay.ID, result.PageIndex, result.PageTotal)
 			continue
 		}
 		requestLogger.Info("telegram relay claimed",
@@ -410,12 +425,168 @@ func (r *Router) handleClaimRelays(ctx context.Context, b *bot.Bot, chatID int64
 			slog.String("delivery_method", string(result.Method)),
 			slog.Int("out_message_id", result.OutMessageID),
 		)
+		r.sendPageNavigator(ctx, b, claim.ClaimerChatID, claim.ClaimerUserID, result.Relay.ID, result.PageIndex, result.PageTotal)
 	}
 
 	if len(failedLines) == 0 {
 		return
 	}
 	r.replyText(ctx, b, chatID, strings.Join(failedLines, "\n"))
+}
+
+func (r *Router) handleCallbackQuery(ctx context.Context, b *bot.Bot, query *models.CallbackQuery) {
+	if query == nil {
+		return
+	}
+
+	answer := func(text string) {
+		params := &bot.AnswerCallbackQueryParams{
+			CallbackQueryID: query.ID,
+		}
+		if text != "" {
+			params.Text = text
+		}
+		if _, err := b.AnswerCallbackQuery(ctx, params); err != nil {
+			r.logger.Warn("answer callback query failed", slog.Any("error", err))
+		}
+	}
+
+	data := strings.TrimSpace(query.Data)
+	if data == "" || data == pageCallbackNoop {
+		answer("")
+		return
+	}
+
+	nav, ok := parsePageCallbackData(data)
+	if !ok {
+		answer("")
+		return
+	}
+	if nav.UserID != query.From.ID {
+		answer("只有领取该文件的用户可以翻页。")
+		return
+	}
+	if query.Message.Message == nil {
+		answer("翻页消息不可用，请重新发送 code。")
+		return
+	}
+
+	message := query.Message.Message
+	if message.Chat.Type != "private" {
+		answer("请在私聊中操作翻页。")
+		return
+	}
+
+	result, err := r.service.ClaimRelayPage(ctx, relay.ClaimRelayPageInput{
+		RelayID:       nav.RelayID,
+		PageIndex:     nav.PageIndex,
+		ClaimerUserID: query.From.ID,
+		ClaimerChatID: message.Chat.ID,
+	})
+	if err != nil {
+		answer(r.describeError(err))
+		return
+	}
+
+	if _, err := b.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:      message.Chat.ID,
+		MessageID:   message.ID,
+		Text:        formatPageNavigatorText(result.PageIndex, result.PageTotal),
+		ReplyMarkup: buildPageNavigatorMarkup(result.Relay.ID, query.From.ID, result.PageIndex, result.PageTotal),
+	}); err != nil {
+		r.logger.Warn("edit page navigator failed",
+			slog.Int64("chat_id", message.Chat.ID),
+			slog.Int("message_id", message.ID),
+			slog.Any("error", err),
+		)
+	}
+
+	answer(fmt.Sprintf("已发送第 %d/%d 页。", result.PageIndex, result.PageTotal))
+}
+
+func (r *Router) sendPageNavigator(ctx context.Context, b *bot.Bot, chatID, userID, relayID int64, currentPage, totalPages int) {
+	if totalPages <= 1 || currentPage <= 0 {
+		return
+	}
+
+	if _, err := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:      chatID,
+		Text:        formatPageNavigatorText(currentPage, totalPages),
+		ReplyMarkup: buildPageNavigatorMarkup(relayID, userID, currentPage, totalPages),
+	}); err != nil {
+		r.logger.Warn("send page navigator failed",
+			slog.Int64("chat_id", chatID),
+			slog.Int64("relay_id", relayID),
+			slog.Any("error", err),
+		)
+	}
+}
+
+func formatPageNavigatorText(currentPage, totalPages int) string {
+	return fmt.Sprintf("分页领取：第 %d/%d 页。点击按钮切换页面。", currentPage, totalPages)
+}
+
+func buildPageNavigatorMarkup(relayID, userID int64, currentPage, totalPages int) *models.InlineKeyboardMarkup {
+	prevData := pageCallbackNoop
+	nextData := pageCallbackNoop
+	if currentPage > 1 {
+		prevData = buildPageCallbackData(relayID, currentPage-1, totalPages, userID)
+	}
+	if currentPage < totalPages {
+		nextData = buildPageCallbackData(relayID, currentPage+1, totalPages, userID)
+	}
+
+	return &models.InlineKeyboardMarkup{
+		InlineKeyboard: [][]models.InlineKeyboardButton{
+			{
+				{Text: "上一页", CallbackData: prevData},
+				{Text: fmt.Sprintf("%d/%d", currentPage, totalPages), CallbackData: pageCallbackNoop},
+				{Text: "下一页", CallbackData: nextData},
+			},
+		},
+	}
+}
+
+type pageCallback struct {
+	RelayID   int64
+	PageIndex int
+	PageTotal int
+	UserID    int64
+}
+
+func buildPageCallbackData(relayID int64, pageIndex, pageTotal int, userID int64) string {
+	return fmt.Sprintf("%s:%d:%d:%d:%d", pageCallbackPrefix, relayID, pageIndex, pageTotal, userID)
+}
+
+func parsePageCallbackData(data string) (pageCallback, bool) {
+	parts := strings.Split(data, ":")
+	if len(parts) != 5 || parts[0] != pageCallbackPrefix {
+		return pageCallback{}, false
+	}
+
+	relayID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || relayID <= 0 {
+		return pageCallback{}, false
+	}
+	pageIndex, err := strconv.Atoi(parts[2])
+	if err != nil || pageIndex <= 0 {
+		return pageCallback{}, false
+	}
+	pageTotal, err := strconv.Atoi(parts[3])
+	if err != nil || pageTotal <= 0 {
+		return pageCallback{}, false
+	}
+	userID, err := strconv.ParseInt(parts[4], 10, 64)
+	if err != nil || userID <= 0 {
+		return pageCallback{}, false
+	}
+
+	return pageCallback{
+		RelayID:   relayID,
+		PageIndex: pageIndex,
+		PageTotal: pageTotal,
+		UserID:    userID,
+	}, true
 }
 
 func formatClaimFailure(rawCode, message string, includeCodeHint bool) string {

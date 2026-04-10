@@ -23,6 +23,7 @@ var (
 	ErrBatchSessionNotFound = errors.New("batch upload session not found")
 	ErrBatchSessionEmpty    = errors.New("batch upload session is empty")
 	ErrBatchItemLimit       = errors.New("batch upload item limit reached")
+	ErrPageOutOfRange       = errors.New("page out of range")
 )
 
 type DeliveryError struct {

@@ -34,22 +34,20 @@ func TestExtractClaimRelayInputsFromText(t *testing.T) {
 	}
 }
 
-func TestExtractClaimRelayInputsFromCaptionDedupesCodes(t *testing.T) {
+func TestExtractClaimRelayInputsIgnoreCaptionOnly(t *testing.T) {
 	update := &models.Update{
 		ID: 7,
 		Message: &models.Message{
-			Caption: "第一个 relaybot_aZ09BcDeF123GhIjK456，重复 relaybot_aZ09BcDeF123GhIjK456",
-			From:    &models.User{ID: 1},
-			Chat:    models.Chat{ID: 2},
+			Caption:  "relaybot_aZ09BcDeF123GhIjK456",
+			Document: &models.Document{FileID: "file-id", FileUniqueID: "file-uniq"},
+			From:     &models.User{ID: 1},
+			Chat:     models.Chat{ID: 2},
 		},
 	}
 
 	claims := ExtractClaimRelayInputs(update)
-	if len(claims) != 1 {
-		t.Fatalf("expected 1 deduplicated claim, got %d", len(claims))
-	}
-	if claims[0].RawCode != "relaybot_aZ09BcDeF123GhIjK456" {
-		t.Fatalf("unexpected code: %q", claims[0].RawCode)
+	if len(claims) != 0 {
+		t.Fatalf("expected no claim extracted from caption, got %d", len(claims))
 	}
 }
 
@@ -72,6 +70,43 @@ func TestExtractClaimRelayInputReturnsFirstMatch(t *testing.T) {
 	}
 }
 
+func TestExtractClaimRelayInputsOnlyUseTextWhenTextAndCaptionBothPresent(t *testing.T) {
+	update := &models.Update{
+		ID: 88,
+		Message: &models.Message{
+			Text:    "text 中包含 relaybot_aZ09BcDeF123GhIjK456",
+			Caption: "caption 中包含 relaybot_Z9y8X7w6V5u4T3s2R1q0",
+			From:    &models.User{ID: 1},
+			Chat:    models.Chat{ID: 2},
+		},
+	}
+
+	claims := ExtractClaimRelayInputs(update)
+	if len(claims) != 1 {
+		t.Fatalf("expected 1 claim from text only, got %d", len(claims))
+	}
+	if claims[0].RawCode != "relaybot_aZ09BcDeF123GhIjK456" {
+		t.Fatalf("unexpected code: %q", claims[0].RawCode)
+	}
+}
+
+func TestExtractClaimRelayInputsIgnoreForwardedText(t *testing.T) {
+	update := &models.Update{
+		ID: 99,
+		Message: &models.Message{
+			Text:          "relaybot_aZ09BcDeF123GhIjK456",
+			ForwardOrigin: &models.MessageOrigin{},
+			From:          &models.User{ID: 1},
+			Chat:          models.Chat{ID: 2},
+		},
+	}
+
+	claims := ExtractClaimRelayInputs(update)
+	if len(claims) != 0 {
+		t.Fatalf("expected no claim extracted from forwarded text, got %d", len(claims))
+	}
+}
+
 func TestExtractClaimRelayInputKeepsOriginalUpdateIDForSingleCode(t *testing.T) {
 	update := &models.Update{
 		ID: 123,
@@ -88,5 +123,35 @@ func TestExtractClaimRelayInputKeepsOriginalUpdateIDForSingleCode(t *testing.T) 
 	}
 	if claims[0].RequestUpdateID != 123 {
 		t.Fatalf("expected original update id 123, got %d", claims[0].RequestUpdateID)
+	}
+}
+
+func TestExtractCreateRelayInputClearsCaption(t *testing.T) {
+	update := &models.Update{
+		ID: 55,
+		Message: &models.Message{
+			ID:      66,
+			Caption: "this should not be kept",
+			Document: &models.Document{
+				FileID:       "doc-file-id",
+				FileUniqueID: "doc-unique-id",
+				FileName:     "a.txt",
+				MimeType:     "text/plain",
+				FileSize:     128,
+			},
+			From: &models.User{ID: 1001},
+			Chat: models.Chat{ID: 2002},
+		},
+	}
+
+	input, ok := ExtractCreateRelayInput(update)
+	if !ok {
+		t.Fatal("expected document upload to be extracted")
+	}
+	if input.Caption != "" {
+		t.Fatalf("expected empty caption, got %q", input.Caption)
+	}
+	if input.TelegramFileID != "doc-file-id" {
+		t.Fatalf("unexpected file id: %q", input.TelegramFileID)
 	}
 }

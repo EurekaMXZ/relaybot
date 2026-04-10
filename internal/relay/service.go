@@ -665,6 +665,21 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 		return ClaimRelayResult{}, missingItemsErr
 	}
 
+	pages, err := buildClaimDeliveryPages(items)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelError, "relay claim failed",
+			append(attrs,
+				slog.String("stage", "paginate_relay_items"),
+				slog.Int64("relay_id", item.ID),
+				slog.Any("error", err),
+			)...,
+		)
+		return ClaimRelayResult{}, err
+	}
+	if len(pages) == 0 {
+		return ClaimRelayResult{}, errors.New("relay delivery pages missing")
+	}
+
 	delivery, created, err := s.store.CreateDelivery(ctx, CreateDeliveryParams{
 		RelayID:         item.ID,
 		RequestUpdateID: input.RequestUpdateID,
@@ -701,6 +716,8 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 				Delivery:   delivery,
 				Method:     delivery.Method,
 				Duplicated: true,
+				PageIndex:  1,
+				PageTotal:  len(pages),
 			}
 			if delivery.TelegramOutMessageID != nil {
 				result.OutMessageID = *delivery.TelegramOutMessageID
@@ -729,19 +746,23 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 		}
 	}
 
+	firstPage := pages[0]
+
 	s.logger.LogAttrs(ctx, slog.LevelInfo, "relay delivery started",
 		append(attrs,
 			slog.Int64("relay_id", item.ID),
 			slog.String("code_hint", item.CodeHint),
 			slog.Int64("delivery_id", delivery.ID),
+			slog.Int("delivery_item_count", len(items)),
+			slog.Int("delivery_page_count", len(pages)),
 		)...,
 	)
 
-	method, outMessageID, err := s.sender.Deliver(ctx, item, items, input.ClaimerChatID)
-	if err != nil {
+	method, outMessageID, deliverErr := s.sender.DeliverPage(ctx, item, firstPage, input.ClaimerChatID)
+	if deliverErr != nil {
 		var senderErr SenderError
 		switch {
-		case errors.As(err, &senderErr) && senderErr.UnknownResult():
+		case errors.As(deliverErr, &senderErr) && senderErr.UnknownResult():
 			if markErr := s.store.MarkDeliveryUnknown(ctx, MarkDeliveryUnknownParams{
 				DeliveryID: delivery.ID,
 				ErrorCode:  senderErr.Code(),
@@ -753,6 +774,8 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 						slog.Int64("relay_id", item.ID),
 						slog.String("code_hint", item.CodeHint),
 						slog.Int64("delivery_id", delivery.ID),
+						slog.Int("delivery_page_index", firstPage.Index),
+						slog.Int("delivery_page_total", firstPage.Total),
 						slog.String("error_code", senderErr.Code()),
 						slog.Any("error", markErr),
 					)...,
@@ -764,11 +787,13 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 					slog.Int64("relay_id", item.ID),
 					slog.String("code_hint", item.CodeHint),
 					slog.Int64("delivery_id", delivery.ID),
+					slog.Int("delivery_page_index", firstPage.Index),
+					slog.Int("delivery_page_total", firstPage.Total),
 					slog.String("error_code", senderErr.Code()),
 					slog.String("error_desc", senderErr.Description()),
 				)...,
 			)
-		case errors.As(err, &senderErr):
+		case errors.As(deliverErr, &senderErr):
 			if markErr := s.store.MarkDeliveryFailed(ctx, MarkDeliveryFailedParams{
 				DeliveryID: delivery.ID,
 				ErrorCode:  senderErr.Code(),
@@ -780,6 +805,8 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 						slog.Int64("relay_id", item.ID),
 						slog.String("code_hint", item.CodeHint),
 						slog.Int64("delivery_id", delivery.ID),
+						slog.Int("delivery_page_index", firstPage.Index),
+						slog.Int("delivery_page_total", firstPage.Total),
 						slog.String("error_code", senderErr.Code()),
 						slog.Any("error", markErr),
 					)...,
@@ -791,6 +818,8 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 					slog.Int64("relay_id", item.ID),
 					slog.String("code_hint", item.CodeHint),
 					slog.Int64("delivery_id", delivery.ID),
+					slog.Int("delivery_page_index", firstPage.Index),
+					slog.Int("delivery_page_total", firstPage.Total),
 					slog.String("error_code", senderErr.Code()),
 					slog.String("error_desc", senderErr.Description()),
 				)...,
@@ -799,7 +828,7 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 			if markErr := s.store.MarkDeliveryFailed(ctx, MarkDeliveryFailedParams{
 				DeliveryID: delivery.ID,
 				ErrorCode:  "delivery_failed",
-				ErrorDesc:  err.Error(),
+				ErrorDesc:  deliverErr.Error(),
 				UpdatedAt:  now,
 			}); markErr != nil {
 				s.logger.LogAttrs(ctx, slog.LevelError, "relay delivery mark failed failed",
@@ -807,6 +836,8 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 						slog.Int64("relay_id", item.ID),
 						slog.String("code_hint", item.CodeHint),
 						slog.Int64("delivery_id", delivery.ID),
+						slog.Int("delivery_page_index", firstPage.Index),
+						slog.Int("delivery_page_total", firstPage.Total),
 						slog.String("error_code", "delivery_failed"),
 						slog.Any("error", markErr),
 					)...,
@@ -818,12 +849,18 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 					slog.Int64("relay_id", item.ID),
 					slog.String("code_hint", item.CodeHint),
 					slog.Int64("delivery_id", delivery.ID),
+					slog.Int("delivery_page_index", firstPage.Index),
+					slog.Int("delivery_page_total", firstPage.Total),
 					slog.String("error_code", "delivery_failed"),
-					slog.Any("error", err),
+					slog.Any("error", deliverErr),
 				)...,
 			)
 		}
-		return ClaimRelayResult{Relay: item, Delivery: delivery}, err
+		return ClaimRelayResult{Relay: item, Delivery: delivery}, deliverErr
+	}
+
+	if len(items) > 1 {
+		method = DeliveryMethodSendBatch
 	}
 
 	if err := s.store.MarkDeliverySent(ctx, MarkDeliverySentParams{
@@ -867,7 +904,79 @@ func (s *Service) ClaimRelay(ctx context.Context, input ClaimRelayInput) (ClaimR
 		Delivery:     delivery,
 		OutMessageID: outMessageID,
 		Method:       method,
+		PageIndex:    firstPage.Index,
+		PageTotal:    firstPage.Total,
 	}, nil
+}
+
+func (s *Service) ClaimRelayPage(ctx context.Context, input ClaimRelayPageInput) (ClaimRelayPageResult, error) {
+	if input.PageIndex <= 0 {
+		return ClaimRelayPageResult{}, ErrPageOutOfRange
+	}
+
+	now := s.clock.Now().UTC()
+
+	item, err := s.store.GetRelayByID(ctx, input.RelayID)
+	if err != nil {
+		return ClaimRelayPageResult{}, err
+	}
+	if item.Status == RelayStatusExpired || !item.ExpiresAt.After(now) {
+		return ClaimRelayPageResult{}, ErrRelayExpired
+	}
+	if item.Status != RelayStatusReady {
+		return ClaimRelayPageResult{}, ErrRelayNotFound
+	}
+
+	items, err := s.store.ListRelayItemsByRelayID(ctx, item.ID)
+	if err != nil {
+		return ClaimRelayPageResult{}, err
+	}
+	pages, err := buildClaimDeliveryPages(items)
+	if err != nil {
+		return ClaimRelayPageResult{}, err
+	}
+	if input.PageIndex > len(pages) {
+		return ClaimRelayPageResult{}, ErrPageOutOfRange
+	}
+
+	page := pages[input.PageIndex-1]
+	method, outMessageID, err := s.sender.DeliverPage(ctx, item, page, input.ClaimerChatID)
+	if err != nil {
+		return ClaimRelayPageResult{}, err
+	}
+	if len(page.Items) > 1 {
+		method = DeliveryMethodSendBatch
+	}
+
+	return ClaimRelayPageResult{
+		Relay:        item,
+		OutMessageID: outMessageID,
+		Method:       method,
+		PageIndex:    page.Index,
+		PageTotal:    page.Total,
+	}, nil
+}
+
+func buildClaimDeliveryPages(items []RelayItem) ([]DeliveryPage, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	pagedItems, err := PaginateRelayItems(items)
+	if err != nil {
+		return nil, err
+	}
+
+	pages := make([]DeliveryPage, 0, len(pagedItems))
+	total := len(pagedItems)
+	for i, pageItems := range pagedItems {
+		pages = append(pages, DeliveryPage{
+			Index: i + 1,
+			Total: total,
+			Items: pageItems,
+		})
+	}
+	return pages, nil
 }
 
 func (s *Service) lookupRelay(ctx context.Context, codeHash string, now time.Time) (Relay, error) {

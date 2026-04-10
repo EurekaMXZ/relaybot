@@ -133,6 +133,23 @@ type ClaimRelayResult struct {
 	OutMessageID int
 	Method       DeliveryMethod
 	Duplicated   bool
+	PageIndex    int
+	PageTotal    int
+}
+
+type ClaimRelayPageInput struct {
+	RelayID       int64
+	PageIndex     int
+	ClaimerUserID int64
+	ClaimerChatID int64
+}
+
+type ClaimRelayPageResult struct {
+	Relay        Relay
+	OutMessageID int
+	Method       DeliveryMethod
+	PageIndex    int
+	PageTotal    int
 }
 
 type StartBatchUploadInput struct {
